@@ -105,3 +105,7 @@ CLAUDE.local.md
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Thesis-eigene Auswertung versionieren (Ausnahme von *.ipynb / /notebooks)
+!thesis/
+!thesis/**
