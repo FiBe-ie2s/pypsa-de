@@ -420,7 +420,7 @@ industry:
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#solving
 solving:
   runtime: 12h
-  mem_mb: 110000 #30000 is OK for 22 nodes, 365H; 140000 for 22 nodes 3H; 400000 for 44 nodes 3H; ~110000 for 27 nodes 6H (est.)
+  mem_mb: 60000 # lowered for shared DevCloud (does NOT enforce hard limit, just scheduler hint)
   options:
     transmission_losses: true
     custom_extra_functionality: "../scripts/pypsa-de/additional_functionality.py"
@@ -624,13 +624,18 @@ solving:
         2040: 30
         2045: 35
         2050: 35
-  # solver:
-  #   options: gurobi-numeric-focus
-  # solver_options:
-  #   gurobi-default:
-  #     NumericFocus: 1
-  #     FeasibilityTol: 1.e-4
-  #     BarHomogeneous: 1
+  solver:
+    options: gurobi-default
+  solver_options:
+    gurobi-default:
+      threads: 4 # limit CPU on shared DevCloud (default was 32!)
+      method: 2
+      crossover: 0
+      BarConvTol: 1.0e-05
+      Seed: 123
+      AggFill: 0
+      PreDual: 0
+      GURO_PAR_BARDENSETHRESH: 200
 
 plotting:
   tech_colors:

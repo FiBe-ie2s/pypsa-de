@@ -4,4 +4,5 @@
 
 # See https://snakemake.readthedocs.io/en/stable/executing/cli.html#profiles
 
+cores: 4
 logger: pypsa
