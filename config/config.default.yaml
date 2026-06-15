@@ -178,7 +178,7 @@ electricity:
       Offshore: "offwind-ac"
       Onshore: onwind
       PV: solar
-  estimate_battery_capacities: false
+  estimate_battery_capacities: true
   autarky:
     enable: false
     by_country: false
