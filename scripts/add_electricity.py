@@ -736,27 +736,109 @@ def attach_existing_batteries(
     costs: pd.DataFrame,
     ppl: pd.DataFrame,
 ) -> None:
-    """Attach existing battery storage units from the power plant dataset."""
-    batt = ppl.query('carrier == "battery"')
+    """Attach existing battery storage as stores and links from the power
+    plant dataset.
+
+    Uses the same Store + Links pattern as endogenous battery expansion in
+    ``attach_stores`` for consistency. If battery buses already exist (i.e.
+    battery is among the extendable Store carriers), existing capacities are
+    set as ``e_nom_min`` / ``p_nom_min`` on the existing components.
+    Otherwise, new non-extendable Store + Links are created.
+    """
+    carrier = "battery"
+    batt = ppl.query("carrier == @carrier").copy()
     if batt.empty:
         return
 
-    add_missing_carriers(n, ["battery"])
-    efficiency = np.sqrt(costs.at["battery inverter", "efficiency"])
-    batt["max_hours"] = batt.max_hours.fillna(batt.max_hours.median())
+    lookup = STORE_LOOKUP[carrier]
+    lookup_store = lookup["store"]
+    lookup_charger = lookup["bicharger"]
+    roundtrip_correction = lookup.get("roundtrip_correction", 1)
 
-    n.add(
-        "StorageUnit",
-        batt.index,
-        carrier="battery",
-        bus=batt.bus,
-        p_nom=batt.p_nom,
-        capital_cost=batt.capital_cost,
-        max_hours=batt.max_hours,
-        efficiency_store=efficiency,
-        efficiency_dispatch=efficiency,
-        cyclic_state_of_charge=True,
+    charge_efficiency = costs.at[lookup_charger, "efficiency"] ** roundtrip_correction
+    discharge_efficiency = costs.at[lookup_charger, "efficiency"] ** roundtrip_correction
+
+    # Fill missing max_hours; fall back to 1 h if all are NaN
+    if "max_hours" in batt.columns and batt.max_hours.notna().any():
+        batt["max_hours"] = batt.max_hours.fillna(batt.max_hours.median())
+    else:
+        batt["max_hours"] = 1.0
+
+    add_missing_carriers(
+        n, [carrier, f"{carrier} charger", f"{carrier} discharger"]
     )
+
+    for _idx, row in batt.iterrows():
+        bus = row.bus
+        battery_bus = f"{bus} {carrier}"
+        store_name = battery_bus
+        charger_name = f"{battery_bus} charger"
+        discharger_name = f"{battery_bus} discharger"
+
+        e_nom = row.p_nom * row.max_hours
+        p_nom = row.p_nom
+
+        if battery_bus in n.buses.index:
+            # Battery bus already exists from attach_stores (endogenous
+            # expansion enabled).  Set minimum capacities so the optimiser
+            # keeps existing capacity while still being free to expand.
+            if store_name in n.stores.index:
+                n.stores.at[store_name, "e_nom_min"] = (
+                    n.stores.at[store_name, "e_nom_min"] + e_nom
+                )
+            if charger_name in n.links.index:
+                n.links.at[charger_name, "p_nom_min"] = (
+                    n.links.at[charger_name, "p_nom_min"] + p_nom
+                )
+            if discharger_name in n.links.index:
+                n.links.at[discharger_name, "p_nom_min"] = (
+                    n.links.at[discharger_name, "p_nom_min"] + p_nom
+                )
+        else:
+            # No endogenous expansion — create non-extendable Store + Links
+            n.add(
+                "Bus",
+                battery_bus,
+                location=bus,
+                carrier=carrier,
+                x=n.buses.at[bus, "x"],
+                y=n.buses.at[bus, "y"],
+            )
+
+            n.add(
+                "Store",
+                store_name,
+                bus=battery_bus,
+                e_cyclic=True,
+                e_nom=e_nom,
+                carrier=carrier,
+                capital_cost=costs.at[lookup_store, "capital_cost"],
+                lifetime=costs.at[lookup_store, "lifetime"],
+            )
+
+            n.add(
+                "Link",
+                charger_name,
+                bus0=bus,
+                bus1=battery_bus,
+                carrier=f"{carrier} charger",
+                efficiency=charge_efficiency,
+                p_nom=p_nom,
+                marginal_cost=costs.at[lookup_charger, "marginal_cost"],
+                lifetime=costs.at[lookup_charger, "lifetime"],
+            )
+
+            n.add(
+                "Link",
+                discharger_name,
+                bus0=battery_bus,
+                bus1=bus,
+                carrier=f"{carrier} discharger",
+                efficiency=discharge_efficiency,
+                p_nom=p_nom,
+                marginal_cost=costs.at[lookup_charger, "marginal_cost"],
+                lifetime=costs.at[lookup_charger, "lifetime"],
+            )
 
     stats = (
         batt.groupby("country")
@@ -765,7 +847,10 @@ def attach_existing_batteries(
         .round(3)
         .sort_values(ascending=False)
     )
-    logger.info(f"Added {len(batt)} existing battery storage units\n({stats} MW)")
+    logger.info(
+        f"Added {len(batt)} existing battery storage as stores and links\n"
+        f"({stats} MW)"
+    )
 
 
 def attach_hydro(

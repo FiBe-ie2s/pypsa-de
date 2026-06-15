@@ -1612,6 +1612,7 @@ rule prepare_sector_network:
             )(w)
             else []
         ),
+        powerplants=resources("powerplants_s_{clusters}.csv"),
         network=resources("networks/base_s_{clusters}_elec_{opts}.nc"),
         eurostat=resources("eurostat_energy_balances.csv"),
         pop_weighted_energy_totals=resources(

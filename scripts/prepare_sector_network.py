@@ -29,10 +29,12 @@ from scripts._helpers import (
     update_config_from_wildcards,
 )
 from scripts.add_electricity import (
+    attach_existing_batteries,
     attach_storageunits,
     attach_stores,
     calculate_annuity,
     flatten,
+    load_and_aggregate_powerplants,
     sanitize_carriers,
     sanitize_locations,
 )
@@ -6681,6 +6683,13 @@ if __name__ == "__main__":
         buses_i=pop_layout.index,
         extendable_carriers=extendable_stores,
     )
+
+    if snakemake.params.electricity.get("estimate_battery_capacities", False):
+        ppl = load_and_aggregate_powerplants(
+            snakemake.input.powerplants,
+            costs,
+        )
+        attach_existing_batteries(n, costs, ppl)
 
     if options["transport"]:
         add_land_transport(
