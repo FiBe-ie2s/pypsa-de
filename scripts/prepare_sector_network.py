@@ -6684,7 +6684,13 @@ if __name__ == "__main__":
         extendable_carriers=extendable_stores,
     )
 
-    if snakemake.params.electricity.get("estimate_battery_capacities", False):
+    # Only add existing batteries for the baseyear to avoid double-counting
+    # across planning horizons in myopic/perfect foresight. For overnight
+    # foresight there is only one horizon, so the check is always True.
+    if (
+        snakemake.params.electricity.get("estimate_battery_capacities", False)
+        and snakemake.params.planning_horizons[0] == investment_year
+    ):
         ppl = load_and_aggregate_powerplants(
             snakemake.input.powerplants,
             costs,
