@@ -4,7 +4,7 @@
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: test_365H_P
+  prefix: test01_365H_P
   name:
   # - ExPol
   - KN2045_Mix
