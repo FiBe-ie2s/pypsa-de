@@ -4,7 +4,7 @@
 
 # docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#run
 run:
-  prefix: test01_365H_P
+  prefix: test01_365H_cluster
   name:
   # - ExPol
   - KN2045_Mix
@@ -94,6 +94,7 @@ snapshots:
   inclusive: 'left'
 
 atlite:
+  nprocesses: 4
   default_cutout: europe-2013-sarah3-era5
   cutouts:
     europe-2013-sarah3-era5:
