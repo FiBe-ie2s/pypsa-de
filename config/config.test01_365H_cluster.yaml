@@ -1,0 +1,28 @@
+# Custom overlay config for test01_365H_cluster run
+# Apply on top of config.de.yaml:
+#   snakemake --profile slurm --configfile config/config.de.yaml config/config.test01_365H_cluster.yaml
+
+run:
+  prefix: test01_365H_cluster
+
+scenario:
+  planning_horizons:
+  - 2025
+  - 2030
+
+atlite:
+  nprocesses: 4
+
+# solving:   ## solver option changes were made for runs on ie2s devcloud 
+#   solver:
+#     options: gurobi-default
+#   solver_options:
+#     gurobi-default:
+#       threads: 4 # limit CPU on shared DevCloud (default was 32!)
+#       method: 2
+#       crossover: 0
+#       BarConvTol: 1.0e-05
+#       Seed: 123
+#       AggFill: 0
+#       PreDual: 0
+#       GURO_PAR_BARDENSETHRESH: 200

@@ -12,3 +12,44 @@ resources
 results
 benchmarks
 logs
+# git
+.git
+
+# pixi
+.pixi
+
+# snakemake
+.snakemake
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# notebooks
+.ipynb_checkpoints/
+
+# editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# generated project outputs
+results/
+logs/
+benchmarks/
+
+# datasets that already exist on cluster
+resources/
+data/
+cutouts/
+
+# local scratch
+*.tmp
+*.swp
+.cache/
