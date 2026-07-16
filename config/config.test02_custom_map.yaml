@@ -1,0 +1,32 @@
+# Custom overlay config for the test02_custom_map run
+# Apply on top of config.de.yaml (loaded automatically by the Snakefile):
+#   snakemake -call <target> --configfile config/config.test02_custom_map.yaml
+#
+# Purpose: mixed temporal resolution in ONE investment run.
+# Four fixed weeks (one per mid-quarter, Monday 00:00 starts) are kept at
+# native hourly resolution; the rest of the year is aggregated to 6h blocks.
+# This yields hourly electricity price windows for the ESA/BESS analysis
+# while keeping the problem size manageable:
+#   4 x 168 hourly + (8760 - 672) / 6 coarse = 2020 effective snapshots
+#   (vs. 1460 at uniform 6H and 2920 at uniform 3H).
+
+run:
+  prefix: test02_custom_map
+
+atlite:
+  nprocesses: 4
+
+clustering:
+  temporal:
+    resolution_sector: custom   # activates the window-based mapping in time_aggregation.py
+    custom:
+      base_resolution: 6h       # resolution outside the hourly windows; must divide 24h
+      window_days: 7            # each window is one full Mon-Sun week
+      hourly_windows:           # mid-quarter weeks (weather year 2013), Monday 00:00 starts
+      - "2013-02-11"
+      - "2013-05-13"
+      - "2013-08-12"
+      - "2013-11-11"
+
+solving:
+  mem_mb: 160000  # ~2020 effective snapshots ~= 0.7 x the 3H estimate (140 GB), generous safety margin

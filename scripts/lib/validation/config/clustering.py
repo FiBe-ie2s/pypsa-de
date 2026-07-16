@@ -8,6 +8,7 @@ Clustering configuration.
 See docs in https://pypsa-eur.readthedocs.io/en/latest/configuration.html#clustering
 """
 
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -88,6 +89,25 @@ class _AggregationStrategiesConfig(BaseModel):
     )
 
 
+class _TemporalCustomConfig(BaseModel):
+    """Configuration for `clustering.temporal.custom` settings (used when `resolution_sector` is set to 'custom')."""
+
+    base_resolution: str = Field(
+        "6h",
+        pattern=r"^\d+[hH]$",
+        description="Temporal resolution outside the hourly windows, e.g. '6h'. The number of hours must divide 24 so that coarse blocks align with the midnight window boundaries.",
+    )
+    window_days: int = Field(
+        7,
+        ge=1,
+        description="Length of each window in days. Snapshots inside a window keep the native (hourly) resolution.",
+    )
+    hourly_windows: list[date] = Field(
+        default_factory=list,
+        description="Start dates (YYYY-MM-DD, i.e. midnight) of the windows kept at native hourly resolution. Must lie fully within the configured snapshots, must not overlap, and must not repeat.",
+    )
+
+
 class _TemporalConfig(BaseModel):
     """Configuration for `clustering.temporal` settings."""
 
@@ -97,7 +117,11 @@ class _TemporalConfig(BaseModel):
     )
     resolution_sector: bool | str = Field(
         False,
-        description="Resample the time-resolution by averaging over every `n` snapshots in `prepare_sector_network`.",
+        description="Resample the time-resolution by averaging over every `n` snapshots in `prepare_sector_network`. Set to 'custom' to keep native hourly resolution inside the windows configured under `clustering.temporal.custom` and aggregate the rest of the year to the coarser `base_resolution`.",
+    )
+    custom: _TemporalCustomConfig = Field(
+        default_factory=_TemporalCustomConfig,
+        description="Settings for `resolution_sector: custom`: native hourly resolution inside the configured windows, `base_resolution` for the rest of the year.",
     )
 
 
