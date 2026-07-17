@@ -13,6 +13,12 @@
 run:
   prefix: test02_custom_map
 
+scenario:
+  planning_horizons:
+  - 2025
+  - 2030
+  - 2035
+
 atlite:
   nprocesses: 4
 
