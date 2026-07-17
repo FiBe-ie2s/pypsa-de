@@ -1,0 +1,40 @@
+# Custom overlay config for the default4712SS run
+# Apply on top of config.de.yaml (loaded automatically by the Snakefile):
+#   snakemake -call <target> --configfile config/config.default4712SS.yaml
+#
+# Purpose: high-resolution mixed temporal resolution in ONE investment run.
+# Four consecutive weeks per quarter (one 28-day block placed mid-quarter,
+# first-of-month 00:00 starts) are kept at native hourly resolution; the rest
+# of the year is aggregated to 3h blocks. This yields long hourly electricity
+# price windows for the ESA/BESS analysis while keeping the problem solvable:
+#   4 x (28*24) hourly + (8760 - 2688) / 3 coarse
+#   = 2688 + 2024 = 4712 effective snapshots
+#   (vs. 2920 at uniform 3H and 2020 in the test02_custom_map run).
+
+run:
+  prefix: default4712SS
+
+scenario:
+  planning_horizons:
+  - 2025
+  - 2030
+  - 2035
+
+atlite:
+  nprocesses: 4
+
+clustering:
+  temporal:
+    resolution_sector: custom   # activates the window-based mapping in time_aggregation.py
+    custom:
+      base_resolution: 3h       # resolution outside the hourly windows; must divide 24h
+      window_days: 28           # each window is four consecutive weeks
+      hourly_windows:           # mid-quarter 4-week blocks (weather year 2013), 00:00 starts
+      - "2013-02-01"            # Q1: 01 Feb - 01 Mar
+      - "2013-05-01"            # Q2: 01 May - 29 May
+      - "2013-08-01"            # Q3: 01 Aug - 29 Aug
+      - "2013-11-01"            # Q4: 01 Nov - 29 Nov
+
+solving:
+  mem_mb: 180000   # ~4712 effective snapshots; ~112 GB estimated peak, generous safety margin (< 256 GB node)
+  runtime: 12h     # est. longest single-horizon solve ~4 h; headroom for cluster load variance
