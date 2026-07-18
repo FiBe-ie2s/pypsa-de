@@ -34,6 +34,7 @@ from scripts.lib.validation.config.scenario import ScenarioConfig
 from scripts.lib.validation.config.sector import SectorConfig
 from scripts.lib.validation.config.snapshots import SnapshotsConfig
 from scripts.lib.validation.config.solar_thermal import SolarThermalConfig
+from scripts.lib.validation.config.solve_operations import SolveOperationsConfig
 from scripts.lib.validation.config.solving import SolvingConfig
 from scripts.lib.validation.config.transformers import TransformersConfig
 from scripts.lib.validation.config.transmission_projects import (
@@ -207,6 +208,10 @@ class ConfigSchema(BaseModel):
     solving: SolvingConfig = Field(
         default_factory=SolvingConfig,
         description="Solver and optimization configuration.",
+    )
+    solve_operations: SolveOperationsConfig = Field(
+        default_factory=SolveOperationsConfig,
+        description="Fixed-capacity hourly dispatch runs on solved networks from other runs.",
     )
     data: DataConfig = Field(
         default_factory=DataConfig,
