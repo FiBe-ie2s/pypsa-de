@@ -1,0 +1,35 @@
+# Custom overlay config for the default8760SS run
+# Apply on top of config.de.yaml (loaded automatically by the Snakefile):
+#   snakemake -call <target> --configfile config/config.default8760SS.yaml
+#
+# Purpose: FULL native hourly resolution for the whole year in ONE investment
+# run, i.e. the uniform-1H counterpart of the mixed-resolution default4712SS.
+# resolution_sector: false keeps every native hourly snapshot:
+#   8760 effective snapshots (vs. 4712 in the mixed run, 2920 at uniform 3H).
+#
+# Resource sizing (see estimate below) is scaled from the 4712SS benchmarks:
+#   snapshot ratio 8760 / 4712 = 1.86x
+#   observed peak RSS (2035, heaviest horizon): ~128 GB
+#   -> full 1H peak estimated ~240-280 GB  => must run on the smp partition
+#      (3 TB, 7 d); the 256 GB standard/wrh/long/scioi nodes are too tight.
+#   observed longest solve ~4.3 h -> full 1H estimated ~9-11 h per horizon.
+
+run:
+  prefix: default8760SS
+
+scenario:
+  planning_horizons:
+  - 2025
+  - 2030
+  - 2035
+
+atlite:
+  nprocesses: 4
+
+clustering:
+  temporal:
+    resolution_sector: false   # native hourly resolution -> 8760 snapshots (no aggregation)
+
+solving:
+  mem_mb: 320000   # ~8760 snapshots; ~240-280 GB estimated peak, margin below smp's 3 TB
+  runtime: 24h     # est. longest single-horizon solve ~9-11 h; generous headroom for cluster load
