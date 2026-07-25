@@ -10,8 +10,12 @@
 # Resource sizing (see estimate below) is scaled from the 4712SS benchmarks:
 #   snapshot ratio 8760 / 4712 = 1.86x
 #   observed peak RSS (2035, heaviest horizon): ~128 GB
-#   -> full 1H peak estimated ~240-280 GB  => must run on the smp partition
-#      (3 TB, 7 d); the 256 GB standard/wrh/long/scioi nodes are too tight.
+#   -> full 1H peak estimated ~240-280 GB  => must run on a large-memory
+#      partition. On ZECM use `wrh` (~1 TB/node, 64 cores, 14 d); the
+#      `standard` partition (~225 GB/node) is too tight. There is no `smp`
+#      partition on this cluster despite what the generic HPC README lists.
+#      Set the partition at submit time, e.g.:
+#        --set-resources solve_sector_network_myopic:partition="wrh"
 #   observed longest solve ~4.3 h -> full 1H estimated ~9-11 h per horizon.
 
 run:
@@ -31,5 +35,5 @@ clustering:
     resolution_sector: false   # native hourly resolution -> 8760 snapshots (no aggregation)
 
 solving:
-  mem_mb: 320000   # ~8760 snapshots; ~240-280 GB estimated peak, margin below smp's 3 TB
+  mem_mb: 320000   # ~8760 snapshots; ~240-280 GB estimated peak, fits wrh's ~1 TB nodes
   runtime: 24h     # est. longest single-horizon solve ~9-11 h; generous headroom for cluster load
