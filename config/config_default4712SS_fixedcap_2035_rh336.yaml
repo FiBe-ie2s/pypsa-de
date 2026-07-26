@@ -1,0 +1,66 @@
+# Rolling-horizon variant of the default4712SS_fixedcap operations run (2035),
+# ~2-week window. Clean A/B partner to the perfect-foresight run: the solved
+# SOURCE network (results/default4712SS/...) is reused unchanged and ONLY the
+# dispatch foresight differs, so any change in price spreads is attributable to
+# the rolling horizon alone.
+#
+# Differences vs. config_default4712SS_fixedcap_2035.yaml:
+#   - run.prefix            -> separate output tree
+#   - solving.options RH    -> rolling_horizon on, 336 h window, 48 h overlap
+#
+# Window = 336 h (14 days), matching Karkossa et al. for comparability.
+# Effective step = horizon - overlap = 288 h -> ~31 windows over 8760 h.
+# (Exact divisibility into the year is not required: PyPSA solves a shorter
+#  final window for the remainder, and the overlap breaks even division anyway.)
+#
+# Run:
+#   snakemake --profile slurm --rerun-triggers mtime --keep-going \
+#     results/default4712SS_fixedcap_rh336/KN2045_Mix/networks/base_s_27__none_2035_op.nc \
+#     --configfile config/config_default4712SS_fixedcap_2035_rh336.yaml
+
+run:
+  prefix: default4712SS_fixedcap_rh336
+
+# Kept identical to the source run (default4712SS) so the donor's data
+# preparation is consistent with how the source 2035 network was built.
+scenario:
+  planning_horizons:
+  - 2025
+  - 2030
+  - 2035
+
+atlite:
+  nprocesses: 4
+
+clustering:
+  temporal:
+    resolution_sector: false   # native hourly resolution for the dispatch network
+
+solve_operations:
+  source_network: "results/default4712SS/KN2045_Mix/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
+  copperplate_zones:
+  - ["DE"]                     # one German bidding zone
+  unfix_free_stores: true
+  co2_atmosphere_constraint: true
+
+solving:
+  # Rolling horizon peak memory is far below the single-pass run (each window is
+  # a small LP). 160 GB is a safe ceiling; lower it after checking the first
+  # memory log if you want faster SLURM placement.
+  mem_mb: 160000
+  runtime: 12h
+  options:
+    # With capacities fixed against block-averaged profiles, single hours can
+    # exceed the fixed capacities. Load shedding/sinks turn such hours into
+    # scarcity prices (value of lost load) instead of infeasibilities.
+    load_shedding:
+      enable: true
+    load_sinks:
+      enable: true
+      all_carriers: true
+    # --- rolling horizon: the ONLY functional difference vs. the PF run ---
+    # prepare_network() will disable cyclic storage and start all storage empty
+    # (state_of_charge_initial/e_initial = 0) for the first window; see Q2 notes.
+    rolling_horizon: true
+    horizon: 336     # hours per window (14 days)
+    overlap: 48      # hours re-solved and discarded to remove the end-of-window storage-dump artifact

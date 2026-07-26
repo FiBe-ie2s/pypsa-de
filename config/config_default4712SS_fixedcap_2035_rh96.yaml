@@ -1,0 +1,64 @@
+# Rolling-horizon variant of the default4712SS_fixedcap operations run (2035),
+# short ~4-day window. Clean A/B partner to the perfect-foresight run: the solved
+# SOURCE network (results/default4712SS/...) is reused unchanged and ONLY the
+# dispatch foresight differs.
+#
+# Differences vs. config_default4712SS_fixedcap_2035.yaml:
+#   - run.prefix            -> separate output tree
+#   - solving.options RH    -> rolling_horizon on, 96 h window, 24 h overlap
+#
+# Window = 96 h (4 days), closer to the ~1-2 day real day-ahead decision horizon.
+# Effective step = horizon - overlap = 72 h -> ~122 windows over 8760 h.
+#
+# WATCH-OUT for this short window: 4-day foresight cannot see a multi-day
+# Dunkelflaute or the seasonal cycle coming, so seasonal/H2 storage may run short
+# -> load shedding -> spurious VOLL price spikes that look like large spreads but
+# are modelling artifacts. After the run, count load-shedding hours and inspect
+# seasonal-storage SOC BEFORE trusting the price series; compare against the PF
+# baseline to separate genuine multi-day peaks from artifact spikes.
+#
+# Run:
+#   snakemake --profile slurm --rerun-triggers mtime --keep-going \
+#     results/default4712SS_fixedcap_rh96/KN2045_Mix/networks/base_s_27__none_2035_op.nc \
+#     --configfile config/config_default4712SS_fixedcap_2035_rh96.yaml
+
+run:
+  prefix: default4712SS_fixedcap_rh96
+
+scenario:
+  planning_horizons:
+  - 2025
+  - 2030
+  - 2035
+
+atlite:
+  nprocesses: 4
+
+clustering:
+  temporal:
+    resolution_sector: false   # native hourly resolution for the dispatch network
+
+solve_operations:
+  source_network: "results/default4712SS/KN2045_Mix/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
+  copperplate_zones:
+  - ["DE"]                     # one German bidding zone
+  unfix_free_stores: true
+  co2_atmosphere_constraint: true
+
+solving:
+  # Many small windows (~122); each solve is small so 160 GB is a safe ceiling.
+  mem_mb: 160000
+  runtime: 12h
+  options:
+    load_shedding:
+      enable: true
+    load_sinks:
+      enable: true
+      all_carriers: true
+    # --- rolling horizon: the ONLY functional difference vs. the PF run ---
+    # prepare_network() disables cyclic storage and starts all storage empty for
+    # the first window; the empty-start artifact is front-loaded into Q1 (winter)
+    # and matters more here than for the 2-week window. See Q2 notes.
+    rolling_horizon: true
+    horizon: 96      # hours per window (4 days)
+    overlap: 24      # hours re-solved and discarded to remove the end-of-window storage-dump artifact
