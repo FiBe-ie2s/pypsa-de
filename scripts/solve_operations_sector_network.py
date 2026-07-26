@@ -43,6 +43,19 @@ logger = logging.getLogger(__name__)
 # set_temporal_aggregation, so the block-mean ratio correction does not apply.
 PLAIN_OVERWRITE_ATTRS = {"e_max_pu", "e_min_pu"}
 
+# Bus carriers of pure accounting buffers (GHG / materials balances) that are
+# meant to be unbounded and may safely be released from the capacity fixing.
+# Energy-carrying stores (battery, EV battery, H2, heat, ...) must NEVER be
+# released: with zero capital cost and unbounded e_nom_max they would become
+# free, unlimited storage and flatten the dispatch (and prices) artificially.
+ACCOUNTING_BUS_CARRIERS = {
+    "co2",
+    "co2 atmosphere",
+    "co2 stored",
+    "co2 sequestered",
+    "non-sequestered HVC",
+}
+
 
 def build_block_map(
     source_snapshots: pd.DatetimeIndex, dense_snapshots: pd.DatetimeIndex
@@ -257,20 +270,40 @@ def fix_all_capacities(n: pypsa.Network) -> None:
 
 def unfix_free_stores(n: pypsa.Network) -> pd.Index:
     """
-    Release accounting stores (zero capital cost, unbounded e_nom_max) again.
+    Release pure accounting stores (e.g. "co2 atmosphere") from the fixing.
 
-    In the source run these buffers (e.g. "co2 atmosphere") were effectively
+    In the source run these GHG/materials balance buffers were effectively
     unconstrained in size; keeping them fixed at their degenerate e_nom_opt
-    would add an artificial bound to the dispatch problem.
+    could add an artificial bound to the dispatch problem.
+
+    Only stores that both look unbounded (zero capital cost, infinite
+    e_nom_max) *and* sit on an accounting bus (see ``ACCOUNTING_BUS_CARRIERS``)
+    are released. This deliberately excludes energy-carrying stores such as EV
+    batteries, which are also zero-cost with infinite e_nom_max but would
+    otherwise become free, unlimited grid storage that flattens the dispatch.
     """
+    bus_carrier = n.stores.bus.map(n.buses.carrier)
     free = n.stores.index[
-        (n.stores.capital_cost == 0) & np.isinf(n.stores.e_nom_max)
+        (n.stores.capital_cost == 0)
+        & np.isinf(n.stores.e_nom_max)
+        & bus_carrier.isin(ACCOUNTING_BUS_CARRIERS)
     ]
     n.stores.loc[free, "e_nom_extendable"] = True
     if len(free):
         logger.info(
             f"Released {len(free)} accounting store(s) from fixed capacities: "
             f"{list(free[:10])}"
+        )
+
+    # Guard: any energy store left extendable here would act as free storage.
+    still_ext = n.stores.index[
+        n.stores.e_nom_extendable & ~n.stores.index.isin(free)
+    ]
+    if len(still_ext):
+        raise RuntimeError(
+            f"{len(still_ext)} store(s) remain extendable after fixing and are "
+            f"not accounting buffers, e.g. {list(still_ext[:10])}. These would "
+            "act as free unlimited storage."
         )
     return free
 

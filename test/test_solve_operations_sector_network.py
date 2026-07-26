@@ -48,6 +48,7 @@ def add_buses(n):
     )
     n.add("Bus", "DE0 low voltage", carrier="low voltage", country="DE")
     n.add("Bus", "DE0 H2", carrier="H2", country="DE")
+    n.add("Bus", "DE0 EV battery", carrier="EV battery", country="DE")
     n.add("Bus", "co2 atmosphere bus", carrier="co2", country="")
 
 
@@ -133,6 +134,26 @@ def make_source():
         e_nom_extendable=True,
         capital_cost=0.0,
         e_nom_max=np.inf,
+    )
+    # Exogenous EV battery: zero capital cost and infinite e_nom_max like the
+    # co2 store, but on an ENERGY bus. Must NEVER be released, or it becomes
+    # free unlimited grid storage (regression guard for the EV-battery bug).
+    n.add(
+        "Store",
+        "DE0 EV battery",
+        bus="DE0 EV battery",
+        e_nom=100.0,
+        e_nom_extendable=False,
+        capital_cost=0.0,
+        e_nom_max=np.inf,
+    )
+    n.add(
+        "Link",
+        "DE0 BEV charger",
+        bus0="DE0 low voltage",
+        bus1="DE0 EV battery",
+        carrier="BEV charger",
+        p_nom=50.0,
     )
 
     n.add("Line", "l-de", bus0="DE0", bus1="DE1", x=0.1, r=0.01, s_nom_extendable=True)
@@ -314,6 +335,11 @@ class TestFixCapacities:
         assert list(freed) == ["co2 atmosphere"]
         assert source.stores.loc["co2 atmosphere", "e_nom_extendable"]
         assert not source.stores.loc["DE0 battery", "e_nom_extendable"]
+        # EV battery is zero-cost with infinite e_nom_max but on an energy bus:
+        # it must stay fixed, otherwise it becomes free unlimited grid storage.
+        assert "DE0 EV battery" not in list(freed)
+        assert not source.stores.loc["DE0 EV battery", "e_nom_extendable"]
+        assert source.stores.loc["DE0 EV battery", "e_nom"] == 100.0
 
 
 class TestCopperplate:
