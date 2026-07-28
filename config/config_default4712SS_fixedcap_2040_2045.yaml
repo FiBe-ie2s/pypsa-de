@@ -1,0 +1,65 @@
+# Custom overlay config for the default4712SS_fixedcap run (planning horizons 2040 & 2045)
+# Apply on top of config.de.yaml (loaded automatically by the Snakefile):
+#   snakemake --profile slurm --rerun-triggers mtime --keep-going \
+#     results/default4712SS_fixedcap/KN2045_Mix/networks/base_s_27__none_2040_op.nc \
+#     results/default4712SS_fixedcap/KN2045_Mix/networks/base_s_27__none_2045_op.nc \
+#     --configfile config/config_default4712SS_fixedcap_2040_2045.yaml
+#
+# Purpose: fixed-capacity hourly dispatch ("operations") runs on the solved
+# default4712SS networks for 2040 and 2045. Same procedure as the 2035 case
+# (config_default4712SS_fixedcap_2035.yaml): fix all capacities of the
+# mixed-resolution investment run, lift the time series to native hourly
+# resolution via a 1H donor, and copperplate the German AC buses into a single
+# market zone.
+#
+# PREREQUISITE: the solved source networks for 2040 and 2045 must already exist
+#   (results/default4712SS/KN2045_Mix/networks/base_s_27__none_{2040,2045}.nc).
+#   These are produced by extending the expansion run's planning_horizons
+#   (config.default4712SS.yaml now lists 2025..2045) — run that FIRST.
+
+run:
+  prefix: default4712SS_fixedcap
+
+# Identical to the source run (default4712SS) so the donor's data preparation
+# is consistent with how the source networks were built. Snakemake only builds
+# the horizon branch(es) whose _op target is requested.
+scenario:
+  planning_horizons:
+  - 2025
+  - 2030
+  - 2035
+  - 2040
+  - 2045
+
+atlite:
+  nprocesses: 4
+
+clustering:
+  temporal:
+    resolution_sector: false   # native hourly resolution for the dispatch network
+
+solve_operations:
+  # Solved capacity-expansion networks of the source run; the wildcards are
+  # filled in from the requested target file. Any temporal resolution works.
+  source_network: "results/default4712SS/KN2045_Mix/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
+  copperplate_zones:
+  - ["DE"]                     # one German bidding zone
+  unfix_free_stores: true
+  co2_atmosphere_constraint: true
+
+solving:
+  mem_mb: 160000
+  runtime: 12h
+  options:
+    # With capacities fixed against block-averaged profiles, single hours can
+    # exceed the fixed capacities. Load shedding/sinks turn such hours into
+    # scarcity prices (value of lost load) instead of infeasibilities.
+    load_shedding:
+      enable: true
+    load_sinks:
+      enable: true
+      all_carriers: true
+    # Fallback if the full-year hourly LP is too large in one piece:
+    # rolling_horizon: true
+    # horizon: 1096    # hours per window
+    # overlap: 168     # hours of overlap between windows

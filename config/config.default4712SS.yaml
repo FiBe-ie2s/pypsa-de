@@ -19,6 +19,8 @@ scenario:
   - 2025
   - 2030
   - 2035
+  - 2040
+  - 2045
 
 atlite:
   nprocesses: 4

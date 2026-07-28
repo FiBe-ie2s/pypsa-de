@@ -19,7 +19,7 @@ cd "$(dirname "$0")" || exit 1        # run from repo root regardless of cwd
 DRY=""
 if [ "${1:-}" = "-n" ]; then
   DRY="-n"
-  echo ">>> DRY RUN — resolving the DAG only, nothing is submitted"
+  echo ">>> DRY RUN - resolving the DAG only, nothing is submitted"
 fi
 
 SMK="snakemake --profile slurm --rerun-triggers mtime --keep-going $DRY"
@@ -27,7 +27,9 @@ SMK="snakemake --profile slurm --rerun-triggers mtime --keep-going $DRY"
 run () {                               # $1 = config, remaining args = targets
   local cfg="$1"; shift
   echo ">>> $(date '+%F %T')  START  $cfg"
-  $SMK --configfile "$cfg" "$@"
+  # targets MUST come before --configfile: snakemake's --configfile is greedy
+  # (nargs='+') and would otherwise swallow the target paths as config files.
+  $SMK "$@" --configfile "$cfg"
   echo ">>> $(date '+%F %T')  ENDE (exit $?)  $cfg"
   echo
 }
@@ -46,4 +48,4 @@ run config/config_default4712SS_fixedcap_2035_rh96.yaml \
   results/default4712SS_fixedcap_rh96/KN2045_Mix/networks/base_s_27__none_2025_op.nc \
   results/default4712SS_fixedcap_rh96/KN2045_Mix/networks/base_s_27__none_2035_op.nc
 
-echo ">>> ALLE LÄUFE FERTIG $(date '+%F %T')"
+echo ">>> ALL RUNS DONE $(date '+%F %T')"
