@@ -29,8 +29,14 @@ unsolved ``prepare_sector_network`` output of the operations run, built with
 Only ``GlobalConstraint`` types that PyPSA re-applies natively (e.g.
 ``operational_limit``) remain active in the dispatch run; ``co2_atmosphere``
 constraints are optionally re-added via ``add_co2_atmosphere_constraint``.
+
+Both kinds of constraint carry *annual* budgets, while a rolling-horizon solve
+rebuilds every constraint once per window. Without correction each window would
+receive the full-year budget (see ``prorate_operational_limits`` and
+``rolling_horizon_co2_constraint``).
 """
 
+import contextlib
 import logging
 
 import numpy as np
@@ -296,9 +302,7 @@ def unfix_free_stores(n: pypsa.Network) -> pd.Index:
         )
 
     # Guard: any energy store left extendable here would act as free storage.
-    still_ext = n.stores.index[
-        n.stores.e_nom_extendable & ~n.stores.index.isin(free)
-    ]
+    still_ext = n.stores.index[n.stores.e_nom_extendable & ~n.stores.index.isin(free)]
     if len(still_ext):
         raise RuntimeError(
             f"{len(still_ext)} store(s) remain extendable after fixing and are "
@@ -326,9 +330,7 @@ def apply_copperplate(n: pypsa.Network, zones: list[list[str]]) -> list[list[str
 
     groups = []
     for group in zones:
-        buses = n.buses.index[
-            (n.buses.carrier == "AC") & n.buses.country.isin(group)
-        ]
+        buses = n.buses.index[(n.buses.carrier == "AC") & n.buses.country.isin(group)]
         if len(buses) < 2:
             logger.warning(
                 f"Copperplate group {group} has fewer than two AC buses; skipping."
@@ -360,14 +362,248 @@ def apply_copperplate(n: pypsa.Network, zones: list[list[str]]) -> list[list[str
     return groups
 
 
+def capture_final_state_of_charge(n: pypsa.Network) -> dict[str, pd.Series]:
+    """
+    Read the solved end-of-horizon storage levels of the source network.
+
+    Must be called on the freshly loaded source network, before
+    :func:`upsample_to_dense` re-indexes the dynamic data (which keeps only
+    *input* series, not solved results like ``stores_t.e``).
+
+    Capacity-expansion runs solve storage cyclically, so the level after the
+    last snapshot equals the level before the first one — i.e. these values are
+    exactly the physically consistent start-of-year filling levels.
+    """
+    levels = {}
+    if not n.stores_t.e.empty:
+        levels["Store"] = n.stores_t.e.iloc[-1].copy()
+    if not n.storage_units_t.state_of_charge.empty:
+        levels["StorageUnit"] = n.storage_units_t.state_of_charge.iloc[-1].copy()
+
+    logger.info(
+        "Captured source storage levels: "
+        + ", ".join(f"{len(v)} {k}(s)" for k, v in levels.items())
+        if levels
+        else "Source network carries no solved storage levels."
+    )
+    return levels
+
+
+def seed_initial_state_of_charge(
+    n: pypsa.Network, levels: dict[str, pd.Series]
+) -> pd.DataFrame:
+    """
+    Start a rolling-horizon run at the source run's storage levels.
+
+    ``prepare_network(rolling_horizon=True)`` switches cyclic storage off and
+    sets every initial level to zero, so the dispatch year starts with all
+    storage empty. For a full-year operations run that silently removes seasonal
+    storage: it can only ever fill up, never draw down a winter stock.
+
+    Pure accounting buffers (``ACCOUNTING_BUS_CARRIERS``, e.g. "co2 atmosphere")
+    are deliberately left at zero — their level *is* the cumulative emission
+    balance of the dispatch year and must not inherit the source run's total.
+
+    Returns
+    -------
+    pd.DataFrame
+        Per component: seeded, skipped (accounting) and unmatched counts.
+    """
+    summary = []
+    specs = [
+        ("Store", n.stores, "e_initial", n.stores.bus.map(n.buses.carrier)),
+        (
+            "StorageUnit",
+            n.storage_units,
+            "state_of_charge_initial",
+            n.storage_units.bus.map(n.buses.carrier),
+        ),
+    ]
+
+    for c_name, static, attr, bus_carrier in specs:
+        source_levels = levels.get(c_name)
+        if source_levels is None or static.empty:
+            continue
+
+        accounting = static.index[bus_carrier.isin(ACCOUNTING_BUS_CARRIERS)]
+        candidates = static.index.difference(accounting)
+        matched = candidates.intersection(source_levels.index)
+
+        static.loc[matched, attr] = source_levels.loc[matched]
+
+        summary.append(
+            {
+                "component": c_name,
+                "seeded": len(matched),
+                "accounting_kept_at_zero": len(accounting),
+                "unmatched": len(candidates.difference(matched)),
+            }
+        )
+
+        unmatched = candidates.difference(matched)
+        if len(unmatched):
+            logger.warning(
+                f"{c_name}: {len(unmatched)} component(s) without a source level "
+                f"start empty, e.g. {list(unmatched[:5])}"
+            )
+
+    if summary:
+        logger.info(
+            "Seeded rolling-horizon storage levels from the source network:\n"
+            + pd.DataFrame(summary).to_string(index=False)
+        )
+    return pd.DataFrame(summary)
+
+
+def prorate_operational_limits(n: pypsa.Network, horizon: int) -> pd.Series:
+    """
+    Scale annual ``operational_limit`` budgets down to a single rolling window.
+
+    ``optimize_with_rolling_horizon`` rebuilds the optimisation model for every
+    window, and PyPSA re-creates each ``operational_limit`` constraint from the
+    unchanged ``constant`` — i.e. the *annual* budget is imposed on every single
+    window. For ``sense: "<="`` that only makes the limit far too lax, but for
+    ``sense: "=="`` (e.g. "unsustainable biomass limit") the annual quantity is
+    *enforced* in every window, inflating the yearly total by roughly
+    ``len(snapshots) / horizon``.
+
+    Every hour of the year ends up carrying one window's worth of the budget
+    (overlapping hours are re-solved and overwritten, not accumulated), so the
+    annual total is restored by scaling with the window's share of the year —
+    independently of ``overlap``.
+
+    Returns
+    -------
+    pd.Series
+        The original constants, indexed by constraint name, so the caller can
+        restore them if needed.
+    """
+    idx = n.global_constraints.index[n.global_constraints.type == "operational_limit"]
+    original = n.global_constraints.loc[idx, "constant"].copy()
+
+    if idx.empty:
+        logger.info("No operational_limit constraints to scale for rolling horizon.")
+        return original
+
+    share = min(horizon / len(n.snapshots), 1.0)
+    if share == 1.0:
+        logger.info(
+            f"Rolling-horizon window ({horizon}) covers all {len(n.snapshots)} "
+            "snapshots; operational_limit constants left unchanged."
+        )
+        return original
+
+    n.global_constraints.loc[idx, "constant"] = original * share
+    logger.info(
+        f"Scaled {len(idx)} operational_limit constraint(s) by {share:.6f} "
+        f"({horizon}h window / {len(n.snapshots)} snapshots) for rolling horizon: "
+        f"{list(idx)}"
+    )
+    return original
+
+
+@contextlib.contextmanager
+def _co2_budget_prorated(n: pypsa.Network, snapshots: pd.Index):
+    """
+    Temporarily shrink ``co2_atmosphere`` budgets to the elapsed share of year.
+
+    The ``co2_atmosphere`` constraint bounds the *cumulative* CO2 store level at
+    the last snapshot of the window, and ``optimize_with_rolling_horizon``
+    carries ``e_initial`` from window to window. The per-window right-hand side
+    must therefore be a growing path (budget x share of the year elapsed), not
+    the annual budget (never binding until the very end) and not the annual
+    budget divided by the number of windows (violated from the second window on,
+    because the store already starts above it).
+    """
+    idx = n.global_constraints.index[n.global_constraints.type == "co2_atmosphere"]
+    original = n.global_constraints.loc[idx, "constant"].copy()
+
+    if idx.empty:
+        yield
+        return
+
+    position = n.snapshots.get_indexer([snapshots[-1]])[0]
+    if position < 0:
+        raise ValueError(
+            f"Rolling-horizon window ends at {snapshots[-1]}, which is not part "
+            "of n.snapshots; cannot determine the elapsed share of the year."
+        )
+    elapsed = (position + 1) / len(n.snapshots)
+
+    n.global_constraints.loc[idx, "constant"] = original * elapsed
+    logger.info(
+        f"co2_atmosphere budget for window ending {snapshots[-1]}: "
+        f"{elapsed:.4f} of the annual budget."
+    )
+    try:
+        yield
+    finally:
+        n.global_constraints.loc[idx, "constant"] = original
+
+
+def rolling_horizon_co2_constraint(base_constraint):
+    """
+    Wrap ``add_co2_atmosphere_constraint`` so the budget grows with the year.
+
+    The wrapped function keeps the signature ``(n, snapshots)`` expected by
+    ``extra_functionality``. Scaling ``constant`` around the unmodified upstream
+    call (instead of reimplementing it) keeps the store selection logic in a
+    single place.
+    """
+
+    def extra_functionality(n: pypsa.Network, snapshots: pd.Index) -> None:
+        with _co2_budget_prorated(n, snapshots):
+            base_constraint(n, snapshots)
+
+    return extra_functionality
+
+
+class _FailedWindowWatcher(logging.Handler):
+    """
+    Collect PyPSA's per-window "Optimization failed" warnings.
+
+    ``optimize_with_rolling_horizon`` only logs failed windows and keeps going,
+    so without this the results of a partially failed run would be exported as
+    if they were valid.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.failures: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if "Optimization failed" in message:
+            self.failures.append(message)
+
+
+@contextlib.contextmanager
+def watch_rolling_horizon_windows():
+    """Raise afterwards if any rolling-horizon window failed to solve."""
+    watcher = _FailedWindowWatcher()
+    pypsa_logger = logging.getLogger("pypsa")
+    pypsa_logger.addHandler(watcher)
+    try:
+        yield watcher
+    finally:
+        pypsa_logger.removeHandler(watcher)
+
+    if watcher.failures:
+        raise RuntimeError(
+            f"{len(watcher.failures)} rolling-horizon window(s) failed to solve; "
+            f"the dispatch and price series are incomplete. First failure: "
+            f"{watcher.failures[0]}"
+        )
+
+
 def export_electricity_prices(n: pypsa.Network, path: str) -> None:
     """Write hourly marginal prices of all AC buses plus per-country means."""
     ac = n.buses.index[n.buses.carrier == "AC"]
     prices = n.buses_t.marginal_price[ac].copy()
     for country in sorted(n.buses.loc[ac, "country"].unique()):
         country_buses = ac[n.buses.loc[ac, "country"] == country]
-        prices[f"price_{country}"] = (
-            n.buses_t.marginal_price[country_buses].mean(axis=1)
+        prices[f"price_{country}"] = n.buses_t.marginal_price[country_buses].mean(
+            axis=1
         )
     prices.to_csv(path)
 
@@ -413,6 +649,9 @@ if __name__ == "__main__":
     n = pypsa.Network(snakemake.input.source_network)
     donor = pypsa.Network(snakemake.input.donor_network)
 
+    # must be read before upsampling drops the solved (non-input) series
+    source_storage_levels = capture_final_state_of_charge(n)
+
     if not (donor.snapshot_weightings.objective == 1.0).all():
         logger.warning(
             "Donor network has non-unit snapshot weightings; expected a "
@@ -446,6 +685,11 @@ if __name__ == "__main__":
         rolling_horizon=rolling_horizon,
     )
 
+    if rolling_horizon:
+        # prepare_network() has just emptied all storage; start the dispatch
+        # year at the source run's (cyclic) filling levels instead.
+        seed_initial_state_of_charge(n, source_storage_levels)
+
     extra_functionality = (
         add_co2_atmosphere_constraint
         if options.get("co2_atmosphere_constraint", True)
@@ -468,10 +712,22 @@ if __name__ == "__main__":
                 log_fn=snakemake.log.solver,
                 mode="rolling_horizon",
             )
+            # Annual budgets would otherwise be imposed once per window.
+            annual_limits = prorate_operational_limits(n, all_kwargs["horizon"])
             if extra_functionality is not None:
-                all_kwargs["extra_functionality"] = extra_functionality
-            n.optimize.optimize_with_rolling_horizon(**all_kwargs)
-            status, condition = "", ""
+                all_kwargs["extra_functionality"] = rolling_horizon_co2_constraint(
+                    extra_functionality
+                )
+            try:
+                with watch_rolling_horizon_windows():
+                    n.optimize.optimize_with_rolling_horizon(**all_kwargs)
+            finally:
+                # Export the network with the annual budgets it was built with,
+                # not the per-window values used internally.
+                n.global_constraints.loc[annual_limits.index, "constant"] = (
+                    annual_limits
+                )
+            status, condition = "ok", ""
         else:
             logger.info("Solving operations network in a single pass...")
             model_kwargs, solve_kwargs = collect_kwargs(

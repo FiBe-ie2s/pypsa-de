@@ -580,10 +580,13 @@ def prepare_network(
 
     # rolling horizon disables cyclic storage
     if rolling_horizon:
-        n.storage_units.state_of_charge_cyclic = False
-        n.storage_units.state_of_charge_initial = 0
-        n.stores.e_cyclic = False
-        n.stores.e_initial = 0
+        # NB: the PyPSA attribute is `cyclic_state_of_charge`; assigning to the
+        # transposed name silently did nothing, leaving storage units cyclic
+        # within every single window.
+        n.storage_units["cyclic_state_of_charge"] = False
+        n.storage_units["state_of_charge_initial"] = 0
+        n.stores["e_cyclic"] = False
+        n.stores["e_initial"] = 0
 
 
 def add_CCL_constraints(

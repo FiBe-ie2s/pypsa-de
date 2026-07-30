@@ -7,6 +7,8 @@ coarse-resolution network to hourly resolution, overwriting time series from
 an hourly donor network, fixing capacities and copperplating market zones.
 """
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pypsa
@@ -15,11 +17,16 @@ import pytest
 from scripts.solve_operations_sector_network import (
     apply_copperplate,
     build_block_map,
+    capture_final_state_of_charge,
     fix_all_capacities,
     map_target_to_donor,
     overwrite_dynamic_from_donor,
+    prorate_operational_limits,
+    rolling_horizon_co2_constraint,
+    seed_initial_state_of_charge,
     unfix_free_stores,
     upsample_to_dense,
+    watch_rolling_horizon_windows,
 )
 
 DENSE = pd.date_range("2013-01-01", periods=48, freq="h")
@@ -123,9 +130,7 @@ def make_source():
         bus="DE0",
         e_nom_extendable=True,
         capital_cost=10.0,
-        e_max_pu=pd.Series(
-            np.linspace(0.5, 1.0, 48), index=DENSE
-        ).resample("6h").min(),
+        e_max_pu=pd.Series(np.linspace(0.5, 1.0, 48), index=DENSE).resample("6h").min(),
     )
     n.add(
         "Store",
@@ -243,16 +248,15 @@ class TestUpsample:
         assert len(source.snapshots) == 48
         assert (source.snapshot_weightings == 1.0).all().all()
         pd.testing.assert_series_equal(
-            source.generators_t.p_max_pu["DE0 solar-2030"], expected,
+            source.generators_t.p_max_pu["DE0 solar-2030"],
+            expected,
             check_names=False,
         )
 
 
 class TestMapTargetToDonor:
     def test_exact_and_suffix_matching(self):
-        build_years = pd.Series(
-            {"a solar-2030": 2030, "a solar": 0, "a pipe-2035": 0}
-        )
+        build_years = pd.Series({"a solar-2030": 2030, "a solar": 0, "a pipe-2035": 0})
         mapping = map_target_to_donor(
             pd.Index(["a solar-2030", "a solar", "a pipe-2035"]),
             build_years,
@@ -391,3 +395,409 @@ class TestFullPipelineSolve:
             source.loads_t.p_set["DE0 load"].values,
             rtol=1e-6,
         )
+
+
+@pytest.fixture
+def constrained():
+    """Hourly network carrying the three GlobalConstraint types of a real run."""
+    n = pypsa.Network()
+    n.set_snapshots(DENSE)  # 48 hourly snapshots
+    add_buses(n)
+    n.add(
+        "GlobalConstraint",
+        "unsustainable biomass limit",
+        type="operational_limit",
+        carrier_attribute="unsustainable solid biomass",
+        sense="==",
+        constant=2400.0,
+    )
+    n.add(
+        "GlobalConstraint",
+        "biomass limit",
+        type="operational_limit",
+        carrier_attribute="solid biomass",
+        sense="<=",
+        constant=4800.0,
+    )
+    n.add(
+        "GlobalConstraint",
+        "CO2Limit",
+        type="co2_atmosphere",
+        carrier_attribute="co2_emissions",
+        sense="<=",
+        constant=960.0,
+    )
+    # ignored by PyPSA (empty type), must not be touched either
+    n.add("GlobalConstraint", "capacity_minimum-DE", sense=">=", constant=12.0)
+    return n
+
+
+class TestProrateOperationalLimits:
+    def test_scales_only_operational_limits(self, constrained):
+        original = prorate_operational_limits(constrained, horizon=12)
+
+        constants = constrained.global_constraints.constant
+        # 12 h window out of 48 snapshots -> quarter of the annual budget
+        assert constants["unsustainable biomass limit"] == pytest.approx(600.0)
+        assert constants["biomass limit"] == pytest.approx(1200.0)
+        # stock-type and untyped constraints stay untouched
+        assert constants["CO2Limit"] == pytest.approx(960.0)
+        assert constants["capacity_minimum-DE"] == pytest.approx(12.0)
+
+        assert set(original.index) == {"unsustainable biomass limit", "biomass limit"}
+        assert original["unsustainable biomass limit"] == pytest.approx(2400.0)
+
+    def test_annual_total_is_restored_independently_of_overlap(self, constrained):
+        """
+        Every hour carries one window's worth of the budget, so the yearly
+        total comes back to the original constant for any overlap.
+        """
+        horizon = 12
+        prorate_operational_limits(constrained, horizon=horizon)
+        per_window = constrained.global_constraints.constant[
+            "unsustainable biomass limit"
+        ]
+        hourly_rate = per_window / horizon
+        assert hourly_rate * len(constrained.snapshots) == pytest.approx(2400.0)
+
+    def test_window_covering_whole_year_is_not_scaled(self, constrained):
+        prorate_operational_limits(constrained, horizon=48)
+        assert constrained.global_constraints.constant[
+            "unsustainable biomass limit"
+        ] == pytest.approx(2400.0)
+
+        prorate_operational_limits(constrained, horizon=100)
+        assert constrained.global_constraints.constant[
+            "unsustainable biomass limit"
+        ] == pytest.approx(2400.0)
+
+    def test_no_operational_limits_is_a_noop(self):
+        n = pypsa.Network()
+        n.set_snapshots(DENSE)
+        assert prorate_operational_limits(n, horizon=12).empty
+
+
+class TestRollingHorizonCo2Constraint:
+    def test_budget_grows_with_elapsed_year(self, constrained):
+        seen = []
+
+        def base(n, snapshots):
+            seen.append(n.global_constraints.constant["CO2Limit"])
+
+        wrapped = rolling_horizon_co2_constraint(base)
+
+        wrapped(constrained, DENSE[0:12])  # first quarter of the 48 h "year"
+        wrapped(constrained, DENSE[12:24])
+        wrapped(constrained, DENSE[36:48])  # final window
+
+        assert seen == pytest.approx([240.0, 480.0, 960.0])
+        # the final window must see the full annual budget
+        assert seen[-1] == pytest.approx(960.0)
+
+    def test_constant_is_restored_after_the_call(self, constrained):
+        wrapped = rolling_horizon_co2_constraint(lambda n, sns: None)
+        wrapped(constrained, DENSE[0:12])
+        assert constrained.global_constraints.constant["CO2Limit"] == pytest.approx(
+            960.0
+        )
+
+    def test_constant_is_restored_when_the_base_raises(self, constrained):
+        def base(n, snapshots):
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            rolling_horizon_co2_constraint(base)(constrained, DENSE[0:12])
+        assert constrained.global_constraints.constant["CO2Limit"] == pytest.approx(
+            960.0
+        )
+
+    def test_rejects_window_outside_the_snapshots(self, constrained):
+        outside = pd.date_range("2020-01-01", periods=2, freq="h")
+        with pytest.raises(ValueError, match="not part"):
+            rolling_horizon_co2_constraint(lambda n, sns: None)(constrained, outside)
+
+    def test_without_co2_constraint_the_base_still_runs(self):
+        n = pypsa.Network()
+        n.set_snapshots(DENSE)
+        calls = []
+        rolling_horizon_co2_constraint(lambda net, sns: calls.append(sns))(
+            n, DENSE[0:12]
+        )
+        assert len(calls) == 1
+
+
+class TestWatchRollingHorizonWindows:
+    def test_passes_when_all_windows_solve(self):
+        with watch_rolling_horizon_windows() as watcher:
+            logging.getLogger("pypsa.optimization.abstract").warning("all good")
+        assert watcher.failures == []
+
+    def test_raises_on_a_failed_window(self):
+        with pytest.raises(RuntimeError, match="failed to solve"):
+            with watch_rolling_horizon_windows():
+                logging.getLogger("pypsa.optimization.abstract").warning(
+                    "Optimization failed with status %s and condition %s",
+                    "warning",
+                    "infeasible",
+                )
+
+    def test_handler_is_detached_afterwards(self):
+        before = len(logging.getLogger("pypsa").handlers)
+        with watch_rolling_horizon_windows():
+            pass
+        assert len(logging.getLogger("pypsa").handlers) == before
+
+
+SNS_RH = pd.date_range("2013-01-01", periods=24, freq="h")
+RH_HORIZON = 6  # -> 4 windows over the 24 h "year"
+
+
+def make_rolling_horizon_network():
+    """
+    Minimal dispatch network with an annual '==' operational_limit.
+
+    Mirrors the real defect: 'unsustainable biomass limit' forces a fixed annual
+    quantity, and cheap biomass would otherwise displace the expensive gas unit.
+    """
+    n = pypsa.Network()
+    n.set_snapshots(SNS_RH)
+    n.add("Bus", "DE0", carrier="AC", country="DE")
+    n.add("Carrier", ["unsustainable solid biomass", "gas"])
+    n.add(
+        "Generator",
+        "DE0 biomass",
+        bus="DE0",
+        carrier="unsustainable solid biomass",
+        p_nom=200.0,
+        marginal_cost=1.0,
+    )
+    n.add(
+        "Generator",
+        "DE0 gas",
+        bus="DE0",
+        carrier="gas",
+        p_nom=200.0,
+        marginal_cost=50.0,
+    )
+    n.add("Load", "DE0 load", bus="DE0", p_set=100.0)
+    n.add(
+        "GlobalConstraint",
+        "unsustainable biomass limit",
+        type="operational_limit",
+        carrier_attribute="unsustainable solid biomass",
+        sense="==",
+        constant=480.0,  # 20 MWh/h over the 24 h year
+    )
+    return n
+
+
+def solve_rolling_horizon(n):
+    n.optimize.optimize_with_rolling_horizon(
+        horizon=RH_HORIZON, overlap=0, solver_name="highs"
+    )
+    return n.generators_t.p["DE0 biomass"].mul(n.snapshot_weightings.objective).sum()
+
+
+class TestRollingHorizonEndToEnd:
+    """Reproduce the annual-budget-per-window defect against real PyPSA."""
+
+    def test_unscaled_annual_limit_is_enforced_once_per_window(self):
+        pytest.importorskip("highspy")
+        n = make_rolling_horizon_network()
+
+        total = solve_rolling_horizon(n)
+
+        # the bug: 480 MWh forced in each of the 4 windows
+        n_windows = len(SNS_RH) / RH_HORIZON
+        assert total == pytest.approx(480.0 * n_windows, rel=1e-4)
+
+    def test_prorating_restores_the_annual_total(self):
+        pytest.importorskip("highspy")
+        n = make_rolling_horizon_network()
+
+        prorate_operational_limits(n, horizon=RH_HORIZON)
+        total = solve_rolling_horizon(n)
+
+        assert total == pytest.approx(480.0, rel=1e-4)
+
+    def test_prorating_matches_the_single_pass_solution(self):
+        pytest.importorskip("highspy")
+        single = make_rolling_horizon_network()
+        single.optimize(solver_name="highs")
+        expected = (
+            single.generators_t.p["DE0 biomass"]
+            .mul(single.snapshot_weightings.objective)
+            .sum()
+        )
+
+        rh = make_rolling_horizon_network()
+        prorate_operational_limits(rh, horizon=RH_HORIZON)
+        assert solve_rolling_horizon(rh) == pytest.approx(expected, rel=1e-4)
+
+
+def make_solved_storage_source():
+    """Source network with solved, cyclic storage levels at its last snapshot."""
+    n = pypsa.Network()
+    n.set_snapshots(COARSE)
+    add_buses(n)
+    n.add("Store", "DE0 H2", bus="DE0 H2", e_nom=100.0, e_cyclic=True)
+    n.add("Store", "DE0 battery", bus="DE0", e_nom=10.0, e_cyclic=True)
+    n.add("Store", "co2 atmosphere", bus="co2 atmosphere bus", e_nom_extendable=True)
+    n.add("StorageUnit", "DE0 PHS", bus="DE0", p_nom=5.0, cyclic_state_of_charge=True)
+
+    n.stores_t.e = pd.DataFrame(
+        {
+            "DE0 H2": np.linspace(10.0, 93.0, len(COARSE)),
+            "DE0 battery": np.linspace(1.0, 4.0, len(COARSE)),
+            "co2 atmosphere": np.linspace(0.0, 950.0, len(COARSE)),
+        },
+        index=COARSE,
+    )
+    n.storage_units_t.state_of_charge = pd.DataFrame(
+        {"DE0 PHS": np.linspace(0.0, 3.5, len(COARSE))}, index=COARSE
+    )
+    return n
+
+
+class TestSeedInitialStateOfCharge:
+    def test_captures_the_last_snapshot(self):
+        levels = capture_final_state_of_charge(make_solved_storage_source())
+        assert levels["Store"]["DE0 H2"] == pytest.approx(93.0)
+        assert levels["StorageUnit"]["DE0 PHS"] == pytest.approx(3.5)
+
+    def test_energy_stores_are_seeded(self):
+        source = make_solved_storage_source()
+        levels = capture_final_state_of_charge(source)
+
+        target = make_solved_storage_source()
+        target.stores["e_initial"] = 0.0  # as prepare_network leaves it
+        target.storage_units["state_of_charge_initial"] = 0.0
+        seed_initial_state_of_charge(target, levels)
+
+        assert target.stores.at["DE0 H2", "e_initial"] == pytest.approx(93.0)
+        assert target.stores.at["DE0 battery", "e_initial"] == pytest.approx(4.0)
+        assert target.storage_units.at[
+            "DE0 PHS", "state_of_charge_initial"
+        ] == pytest.approx(3.5)
+
+    def test_accounting_stores_stay_at_zero(self):
+        """
+        The co2 atmosphere level IS the dispatch year's emission balance;
+        inheriting the source year's total would exhaust the budget instantly.
+        """
+        source = make_solved_storage_source()
+        levels = capture_final_state_of_charge(source)
+
+        target = make_solved_storage_source()
+        target.stores["e_initial"] = 0.0
+        summary = seed_initial_state_of_charge(target, levels)
+
+        assert target.stores.at["co2 atmosphere", "e_initial"] == 0.0
+        store_row = summary.set_index("component").loc["Store"]
+        assert store_row["accounting_kept_at_zero"] == 1
+        assert store_row["seeded"] == 2
+
+    def test_unmatched_components_stay_empty(self):
+        levels = capture_final_state_of_charge(make_solved_storage_source())
+        target = make_solved_storage_source()
+        target.stores["e_initial"] = 0.0
+        target.add("Store", "DE0 new", bus="DE0", e_nom=1.0)
+
+        summary = seed_initial_state_of_charge(target, levels)
+
+        assert target.stores.at["DE0 new", "e_initial"] == 0.0
+        assert summary.set_index("component").loc["Store", "unmatched"] == 1
+
+    def test_source_without_solved_levels_is_a_noop(self):
+        n = pypsa.Network()
+        n.set_snapshots(COARSE)
+        add_buses(n)
+        n.add("Store", "DE0 H2", bus="DE0 H2", e_nom=100.0)
+        assert capture_final_state_of_charge(n) == {}
+        assert seed_initial_state_of_charge(n, {}).empty
+        assert n.stores.at["DE0 H2", "e_initial"] == 0.0
+
+
+class TestPrepareNetworkCyclicFlags:
+    """
+    Guard for the `state_of_charge_cyclic` typo: the assignment must reach
+    the real PyPSA attribute, not create a stray column.
+    """
+
+    def test_rolling_horizon_disables_storage_unit_cyclicity(self):
+        from scripts.solve_network import prepare_network
+
+        n = pypsa.Network()
+        n.set_snapshots(COARSE)
+        add_buses(n)
+        n.add(
+            "StorageUnit",
+            "DE0 PHS",
+            bus="DE0",
+            p_nom=5.0,
+            cyclic_state_of_charge=True,
+            state_of_charge_initial=2.0,
+        )
+        n.add("Store", "DE0 H2", bus="DE0 H2", e_nom=1.0, e_cyclic=True, e_initial=0.5)
+        # add_land_use_constraint() needs a non-empty generators frame;
+        # extendable so it is not treated as existing capacity to subtract
+        n.add(
+            "Generator",
+            "DE0 solar",
+            bus="DE0",
+            carrier="solar",
+            p_nom_extendable=True,
+        )
+
+        prepare_network(
+            n,
+            solve_opts={},
+            foresight="myopic",
+            planning_horizons="2035",
+            co2_sequestration_potential={},
+            rolling_horizon=True,
+        )
+
+        assert not n.storage_units.cyclic_state_of_charge.any()
+        assert (n.storage_units.state_of_charge_initial == 0).all()
+        assert not n.stores.e_cyclic.any()
+        assert (n.stores.e_initial == 0).all()
+
+    def test_single_pass_leaves_cyclicity_untouched(self):
+        from scripts.solve_network import prepare_network
+
+        n = pypsa.Network()
+        n.set_snapshots(COARSE)
+        add_buses(n)
+        n.add(
+            "StorageUnit",
+            "DE0 PHS",
+            bus="DE0",
+            p_nom=5.0,
+            cyclic_state_of_charge=True,
+            state_of_charge_initial=2.0,
+        )
+        n.add("Store", "DE0 H2", bus="DE0 H2", e_nom=1.0, e_cyclic=True, e_initial=0.5)
+        # add_land_use_constraint() needs a non-empty generators frame;
+        # extendable so it is not treated as existing capacity to subtract
+        n.add(
+            "Generator",
+            "DE0 solar",
+            bus="DE0",
+            carrier="solar",
+            p_nom_extendable=True,
+        )
+
+        prepare_network(
+            n,
+            solve_opts={},
+            foresight="myopic",
+            planning_horizons="2035",
+            co2_sequestration_potential={},
+            rolling_horizon=False,
+        )
+
+        assert n.storage_units.cyclic_state_of_charge.all()
+        assert n.storage_units.at["DE0 PHS", "state_of_charge_initial"] == 2.0
+        assert n.stores.e_cyclic.all()
+        assert n.stores.at["DE0 H2", "e_initial"] == 0.5
