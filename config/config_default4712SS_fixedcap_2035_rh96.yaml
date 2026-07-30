@@ -56,9 +56,11 @@ solving:
       enable: true
       all_carriers: true
     # --- rolling horizon: the ONLY functional difference vs. the PF run ---
-    # prepare_network() disables cyclic storage and starts all storage empty for
-    # the first window; the empty-start artifact is front-loaded into Q1 (winter)
-    # and matters more here than for the 2-week window. See Q2 notes.
+    # prepare_network() switches cyclic storage off; solve_operations then seeds
+    # every energy store and storage unit with the source run's (cyclic) filling
+    # level, so the year no longer starts empty. Annual GlobalConstraints are
+    # pro-rated per window (operational_limit) resp. imposed as a growing path
+    # (co2_atmosphere) — without that the annual budgets applied once per window.
     rolling_horizon: true
     horizon: 96      # hours per window (4 days)
     overlap: 24      # hours re-solved and discarded to remove the end-of-window storage-dump artifact
