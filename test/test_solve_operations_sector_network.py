@@ -15,6 +15,7 @@ import pypsa
 import pytest
 
 from scripts.solve_operations_sector_network import (
+    apply_co2_price,
     apply_copperplate,
     build_block_map,
     capture_final_state_of_charge,
@@ -22,7 +23,6 @@ from scripts.solve_operations_sector_network import (
     map_target_to_donor,
     overwrite_dynamic_from_donor,
     prorate_operational_limits,
-    rolling_horizon_co2_constraint,
     seed_initial_state_of_charge,
     unfix_free_stores,
     upsample_to_dense,
@@ -429,6 +429,7 @@ def constrained():
     )
     # ignored by PyPSA (empty type), must not be touched either
     n.add("GlobalConstraint", "capacity_minimum-DE", sense=">=", constant=12.0)
+    n.add("Store", "co2 atmosphere", bus="co2 atmosphere bus", e_nom_extendable=True)
     return n
 
 
@@ -477,53 +478,29 @@ class TestProrateOperationalLimits:
         assert prorate_operational_limits(n, horizon=12).empty
 
 
-class TestRollingHorizonCo2Constraint:
-    def test_budget_grows_with_elapsed_year(self, constrained):
-        seen = []
+class TestApplyCo2Price:
+    def test_prices_the_atmosphere_store(self, constrained):
+        apply_co2_price(constrained, 123.6)
+        # negative sign: emitting (filling the store) costs co2_price per tonne
+        assert constrained.stores.at[
+            "co2 atmosphere", "marginal_cost"
+        ] == pytest.approx(-123.6)
 
-        def base(n, snapshots):
-            seen.append(n.global_constraints.constant["CO2Limit"])
+    def test_removes_the_co2_budget_but_keeps_operational_limits(self, constrained):
+        apply_co2_price(constrained, 123.6)
+        gc = constrained.global_constraints
+        assert (gc.type == "co2_atmosphere").sum() == 0
+        assert set(gc.index[gc.type == "operational_limit"]) == {
+            "unsustainable biomass limit",
+            "biomass limit",
+        }
 
-        wrapped = rolling_horizon_co2_constraint(base)
-
-        wrapped(constrained, DENSE[0:12])  # first quarter of the 48 h "year"
-        wrapped(constrained, DENSE[12:24])
-        wrapped(constrained, DENSE[36:48])  # final window
-
-        assert seen == pytest.approx([240.0, 480.0, 960.0])
-        # the final window must see the full annual budget
-        assert seen[-1] == pytest.approx(960.0)
-
-    def test_constant_is_restored_after_the_call(self, constrained):
-        wrapped = rolling_horizon_co2_constraint(lambda n, sns: None)
-        wrapped(constrained, DENSE[0:12])
-        assert constrained.global_constraints.constant["CO2Limit"] == pytest.approx(
-            960.0
-        )
-
-    def test_constant_is_restored_when_the_base_raises(self, constrained):
-        def base(n, snapshots):
-            raise ValueError("boom")
-
-        with pytest.raises(ValueError, match="boom"):
-            rolling_horizon_co2_constraint(base)(constrained, DENSE[0:12])
-        assert constrained.global_constraints.constant["CO2Limit"] == pytest.approx(
-            960.0
-        )
-
-    def test_rejects_window_outside_the_snapshots(self, constrained):
-        outside = pd.date_range("2020-01-01", periods=2, freq="h")
-        with pytest.raises(ValueError, match="not part"):
-            rolling_horizon_co2_constraint(lambda n, sns: None)(constrained, outside)
-
-    def test_without_co2_constraint_the_base_still_runs(self):
+    def test_raises_without_an_atmosphere_store(self):
         n = pypsa.Network()
         n.set_snapshots(DENSE)
-        calls = []
-        rolling_horizon_co2_constraint(lambda net, sns: calls.append(sns))(
-            n, DENSE[0:12]
-        )
-        assert len(calls) == 1
+        n.add("Bus", "DE0", carrier="AC")
+        with pytest.raises(ValueError, match="atmospheric CO2 store"):
+            apply_co2_price(n, 123.6)
 
 
 class TestWatchRollingHorizonWindows:

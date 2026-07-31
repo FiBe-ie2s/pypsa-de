@@ -26,14 +26,12 @@ unsolved ``prepare_sector_network`` output of the operations run, built with
 4. Optionally, the AC buses of configured country groups are merged into
    single market zones ("copperplating", e.g. one German bidding zone).
 
-Only ``GlobalConstraint`` types that PyPSA re-applies natively (e.g.
-``operational_limit``) remain active in the dispatch run; ``co2_atmosphere``
-constraints are optionally re-added via ``add_co2_atmosphere_constraint``.
-
-Both kinds of constraint carry *annual* budgets, while a rolling-horizon solve
-rebuilds every constraint once per window. Without correction each window would
-receive the full-year budget (see ``prorate_operational_limits`` and
-``rolling_horizon_co2_constraint``).
+Annual ``GlobalConstraint`` budgets need care under rolling horizon, which
+rebuilds every constraint once per window: single-pass runs re-apply the
+``co2_atmosphere`` budget via ``add_co2_atmosphere_constraint``, while
+rolling-horizon runs price CO2 at a fixed rate instead (``apply_co2_price``)
+and pro-rate ``operational_limit`` budgets per window
+(``prorate_operational_limits``).
 """
 
 import contextlib
@@ -502,60 +500,28 @@ def prorate_operational_limits(n: pypsa.Network, horizon: int) -> pd.Series:
     return original
 
 
-@contextlib.contextmanager
-def _co2_budget_prorated(n: pypsa.Network, snapshots: pd.Index):
+def apply_co2_price(n: pypsa.Network, co2_price: float) -> None:
     """
-    Temporarily shrink ``co2_atmosphere`` budgets to the elapsed share of year.
+    Price CO2 emissions at a fixed rate instead of capping them.
 
-    The ``co2_atmosphere`` constraint bounds the *cumulative* CO2 store level at
-    the last snapshot of the window, and ``optimize_with_rolling_horizon``
-    carries ``e_initial`` from window to window. The per-window right-hand side
-    must therefore be a growing path (budget x share of the year elapsed), not
-    the annual budget (never binding until the very end) and not the annual
-    budget divided by the number of windows (violated from the second window on,
-    because the store already starts above it).
+    Sets ``marginal_cost = -co2_price`` on the atmospheric CO2 store (the native
+    pypsa-de carbon-pricing mechanism) and drops the annual ``co2_atmosphere``
+    budget constraint, so emitting costs ``co2_price`` per tonne in every hour
+    without a binding cap.
     """
-    idx = n.global_constraints.index[n.global_constraints.type == "co2_atmosphere"]
-    original = n.global_constraints.loc[idx, "constant"].copy()
+    stores = n.stores.index[n.stores.bus.map(n.buses.carrier) == "co2"]
+    if stores.empty:
+        raise ValueError("No atmospheric CO2 store (bus carrier 'co2') found.")
+    n.stores.loc[stores, "marginal_cost"] = -co2_price
 
-    if idx.empty:
-        yield
-        return
+    caps = n.global_constraints.index[n.global_constraints.type == "co2_atmosphere"]
+    if len(caps):
+        n.remove("GlobalConstraint", caps)
 
-    position = n.snapshots.get_indexer([snapshots[-1]])[0]
-    if position < 0:
-        raise ValueError(
-            f"Rolling-horizon window ends at {snapshots[-1]}, which is not part "
-            "of n.snapshots; cannot determine the elapsed share of the year."
-        )
-    elapsed = (position + 1) / len(n.snapshots)
-
-    n.global_constraints.loc[idx, "constant"] = original * elapsed
     logger.info(
-        f"co2_atmosphere budget for window ending {snapshots[-1]}: "
-        f"{elapsed:.4f} of the annual budget."
+        f"Priced CO2 at {co2_price} EUR/t on {list(stores)}; "
+        f"removed {len(caps)} co2_atmosphere budget constraint(s)."
     )
-    try:
-        yield
-    finally:
-        n.global_constraints.loc[idx, "constant"] = original
-
-
-def rolling_horizon_co2_constraint(base_constraint):
-    """
-    Wrap ``add_co2_atmosphere_constraint`` so the budget grows with the year.
-
-    The wrapped function keeps the signature ``(n, snapshots)`` expected by
-    ``extra_functionality``. Scaling ``constant`` around the unmodified upstream
-    call (instead of reimplementing it) keeps the store selection logic in a
-    single place.
-    """
-
-    def extra_functionality(n: pypsa.Network, snapshots: pd.Index) -> None:
-        with _co2_budget_prorated(n, snapshots):
-            base_constraint(n, snapshots)
-
-    return extra_functionality
 
 
 class _FailedWindowWatcher(logging.Handler):
@@ -690,9 +656,21 @@ if __name__ == "__main__":
         # year at the source run's (cyclic) filling levels instead.
         seed_initial_state_of_charge(n, source_storage_levels)
 
+        # A per-window annual CO2 budget is meaningless under rolling horizon;
+        # price emissions at a fixed rate (from the single-pass shadow price).
+        co2_price = options.get("co2_price")
+        if co2_price is None:
+            raise ValueError(
+                "solve_operations.co2_price (EUR/t) is required for rolling-horizon "
+                "runs. Use the CO2 shadow price of the single-pass run."
+            )
+        apply_co2_price(n, co2_price)
+
+    # Single-pass runs re-impose the annual CO2 budget; rolling-horizon runs
+    # price CO2 instead (above), so no CO2 extra_functionality there.
     extra_functionality = (
         add_co2_atmosphere_constraint
-        if options.get("co2_atmosphere_constraint", True)
+        if not rolling_horizon and options.get("co2_atmosphere_constraint", True)
         else None
     )
 
@@ -712,18 +690,13 @@ if __name__ == "__main__":
                 log_fn=snakemake.log.solver,
                 mode="rolling_horizon",
             )
-            # Annual budgets would otherwise be imposed once per window.
+            # operational_limit budgets are annual; scale them to one window.
             annual_limits = prorate_operational_limits(n, all_kwargs["horizon"])
-            if extra_functionality is not None:
-                all_kwargs["extra_functionality"] = rolling_horizon_co2_constraint(
-                    extra_functionality
-                )
             try:
                 with watch_rolling_horizon_windows():
                     n.optimize.optimize_with_rolling_horizon(**all_kwargs)
             finally:
-                # Export the network with the annual budgets it was built with,
-                # not the per-window values used internally.
+                # restore the annual budgets for the exported network
                 n.global_constraints.loc[annual_limits.index, "constant"] = (
                     annual_limits
                 )
