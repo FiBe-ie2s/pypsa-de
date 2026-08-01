@@ -17,6 +17,7 @@ import pytest
 from scripts.solve_operations_sector_network import (
     apply_co2_price,
     apply_copperplate,
+    apply_unit_commitment,
     build_block_map,
     capture_final_state_of_charge,
     fix_all_capacities,
@@ -501,6 +502,165 @@ class TestApplyCo2Price:
         n.add("Bus", "DE0", carrier="AC")
         with pytest.raises(ValueError, match="atmospheric CO2 store"):
             apply_co2_price(n, 123.6)
+
+
+UC_CSV = (
+    "attribute,OCGT,CCGT\n"
+    "ramp_limit_up,1,1\n"
+    "p_min_pu,0.2,0.45\n"
+    "min_up_time,0,4\n"
+    "min_down_time,0,2\n"
+    "start_up_cost,24,60\n"
+)
+
+
+def make_uc_network():
+    """Dispatch network with committable-eligible power links and a CHP link."""
+    n = pypsa.Network()
+    n.set_snapshots(DENSE)
+    n.add(
+        "Bus",
+        ["DE gas", "DE0", "DE0 heat"],
+        carrier=["gas", "AC", "urban central heat"],
+    )
+    n.add(
+        "Link",
+        "DE0 CCGT",
+        bus0="DE gas",
+        bus1="DE0",
+        carrier="CCGT",
+        p_nom=500.0,
+        efficiency=0.58,
+    )
+    n.add(
+        "Link",
+        "DE0 OCGT",
+        bus0="DE gas",
+        bus1="DE0",
+        carrier="OCGT",
+        p_nom=300.0,
+        efficiency=0.40,
+    )
+    # zero-capacity vintage: must NOT become committable
+    n.add(
+        "Link",
+        "DE0 CCGT old",
+        bus0="DE gas",
+        bus1="DE0",
+        carrier="CCGT",
+        p_nom=0.0,
+        efficiency=0.55,
+    )
+    # CHP: not in the carriers map, must stay untouched
+    n.add(
+        "Link",
+        "DE0 CHP",
+        bus0="DE gas",
+        bus1="DE0",
+        carrier="urban central gas CHP",
+        p_nom=400.0,
+        efficiency=0.42,
+    )
+    return n
+
+
+@pytest.fixture
+def uc_source(tmp_path):
+    path = tmp_path / "unit_commitment.csv"
+    path.write_text(UC_CSV)
+    return str(path)
+
+
+class TestApplyUnitCommitment:
+    def test_sets_committable_only_on_mapped_nonzero_links(self, uc_source):
+        n = make_uc_network()
+        apply_unit_commitment(n, {"CCGT": "CCGT", "OCGT": "OCGT"}, uc_source)
+
+        committable = set(n.links.index[n.links.committable])
+        assert committable == {"DE0 CCGT", "DE0 OCGT"}
+        # zero-capacity vintage and CHP stay non-committable
+        assert not n.links.at["DE0 CCGT old", "committable"]
+        assert not n.links.at["DE0 CHP", "committable"]
+
+    def test_copies_per_unit_params_directly(self, uc_source):
+        n = make_uc_network()
+        apply_unit_commitment(n, {"CCGT": "CCGT"}, uc_source)
+        assert n.links.at["DE0 CCGT", "p_min_pu"] == pytest.approx(0.45)
+        assert n.links.at["DE0 CCGT", "min_up_time"] == 4
+        assert n.links.at["DE0 CCGT", "min_down_time"] == 2
+
+    def test_scales_start_up_cost_by_electric_capacity(self, uc_source):
+        n = make_uc_network()
+        apply_unit_commitment(n, {"CCGT": "CCGT"}, uc_source)
+        # 60 EUR/MW_el * p_nom(500) * efficiency(0.58)
+        assert n.links.at["DE0 CCGT", "start_up_cost"] == pytest.approx(60 * 500 * 0.58)
+
+    def test_carrier_mapping_reuses_a_column(self, uc_source):
+        n = make_uc_network()
+        n.add(
+            "Link",
+            "DE0 H2 CCGT",
+            bus0="DE gas",
+            bus1="DE0",
+            carrier="H2 CCGT",
+            p_nom=200.0,
+            efficiency=0.58,
+        )
+        apply_unit_commitment(n, {"H2 CCGT": "CCGT"}, uc_source)
+        assert n.links.at["DE0 H2 CCGT", "committable"]
+        assert n.links.at["DE0 H2 CCGT", "p_min_pu"] == pytest.approx(0.45)
+
+    def test_missing_column_raises(self, uc_source):
+        n = make_uc_network()
+        with pytest.raises(ValueError, match="not in"):
+            apply_unit_commitment(n, {"CCGT": "lignite"}, uc_source)
+
+    def test_absent_carrier_is_skipped(self, uc_source):
+        n = make_uc_network()
+        applied = apply_unit_commitment(n, {"coal": "CCGT"}, uc_source)
+        assert applied == []
+        assert not n.links.committable.any()
+
+    def test_minimum_load_binds_in_a_linearized_solve(self, uc_source):
+        """
+        min_up_time keeps a committed link online; p_min_pu then forces its
+        output to stay at the minimum load even when demand drops below it.
+        """
+        pytest.importorskip("highspy")
+        n = pypsa.Network()
+        n.set_snapshots(pd.date_range("2013-01-01", periods=2, freq="h"))
+        n.add("Bus", ["DE gas", "DE0"], carrier=["gas", "AC"])
+        n.add("Generator", "DE gas", bus="DE gas", p_nom=1000.0, marginal_cost=1.0)
+        # sole supply -> must be committed in t0 to serve the 100 MW peak
+        n.add(
+            "Link",
+            "DE0 CCGT",
+            bus0="DE gas",
+            bus1="DE0",
+            carrier="CCGT",
+            p_nom=100.0,
+            efficiency=1.0,
+            marginal_cost=5.0,
+        )
+        # zero-cost sink to absorb the forced minimum-load overproduction in t1
+        n.add(
+            "Generator", "DE0 sink", bus="DE0", p_nom=1000.0, sign=-1, marginal_cost=0.0
+        )
+        n.add(
+            "Load",
+            "DE0 load",
+            bus="DE0",
+            p_set=pd.Series([100.0, 10.0], index=n.snapshots),
+        )
+
+        apply_unit_commitment(
+            n, {"CCGT": "CCGT"}, uc_source
+        )  # p_min_pu 0.45, min_up_time 4
+
+        status, _ = n.optimize(solver_name="highs", linearized_unit_commitment=True)
+        assert status == "ok"
+        # on in t0 (load 100), held on in t1 by min_up_time -> output >= 45 despite load 10
+        assert n.links_t.p0["DE0 CCGT"].iloc[1] >= 45.0 - 1e-4
 
 
 class TestWatchRollingHorizonWindows:

@@ -500,6 +500,66 @@ def prorate_operational_limits(n: pypsa.Network, horizon: int) -> pd.Series:
     return original
 
 
+# start-up / shut-down / stand-by costs in unit_commitment.csv are quoted per
+# MW electric, while link p_nom is in MW fuel input; scale by the electric
+# capacity p_nom * efficiency.
+UC_PER_MW_ATTRS = {"start_up_cost", "shut_down_cost", "stand_by_cost"}
+
+
+def apply_unit_commitment(
+    n: pypsa.Network, carriers: dict[str, str], source: str
+) -> list[tuple[str, str, int]]:
+    """
+    Make selected dispatchable links committable for linearized unit commitment.
+
+    ``carriers`` maps a network link carrier to a parameter column of the CSV at
+    ``source`` (e.g. ``{"CCGT": "CCGT", "H2 CCGT": "CCGT"}``). Matching links
+    with non-zero capacity get ``committable=True`` plus the column's per-unit
+    ``p_min_pu``, ramp limits and snapshot-counted up/down times; per-MW-electric
+    start-up costs are scaled by each link's electric capacity.
+
+    The binary status is relaxed to a continuous fraction online through
+    ``solving.options.linearized_unit_commitment``, keeping the problem an LP.
+
+    Returns
+    -------
+    list[tuple[str, str, int]]
+        ``(carrier, column, n_links)`` for each applied carrier.
+    """
+    uc = pd.read_csv(source, index_col=0)
+    applied = []
+
+    for carrier, column in carriers.items():
+        if column not in uc.columns:
+            raise ValueError(
+                f"Unit-commitment column '{column}' not in {source}; "
+                f"available: {list(uc.columns)}."
+            )
+        idx = n.links.index[(n.links.carrier == carrier) & (n.links.p_nom > 0)]
+        if idx.empty:
+            logger.info(f"No links with carrier '{carrier}' and p_nom > 0; skipping.")
+            continue
+
+        n.links.loc[idx, "committable"] = True
+        for attr, value in uc[column].items():
+            if pd.isna(value):
+                continue
+            if attr in UC_PER_MW_ATTRS:
+                n.links.loc[idx, attr] = (
+                    value * n.links.loc[idx, "p_nom"] * n.links.loc[idx, "efficiency"]
+                )
+            else:
+                n.links.loc[idx, attr] = value
+        applied.append((carrier, column, len(idx)))
+
+    if applied:
+        logger.info(
+            "Unit commitment applied: "
+            + ", ".join(f"{c} <- {col} ({k} links)" for c, col, k in applied)
+        )
+    return applied
+
+
 def apply_co2_price(n: pypsa.Network, co2_price: float) -> None:
     """
     Price CO2 emissions at a fixed rate instead of capping them.
@@ -634,6 +694,11 @@ if __name__ == "__main__":
         unfix_free_stores(n)
 
     apply_copperplate(n, options.get("copperplate_zones", []))
+
+    uc = options.get("unit_commitment", {})
+    if uc.get("enable", False):
+        # after fix_all_capacities so start-up costs scale with the fixed p_nom
+        apply_unit_commitment(n, uc.get("carriers", {}), uc.get("source"))
 
     # prepare_network re-adds this constraint from config
     readd = n.global_constraints.index.intersection(["co2_sequestration_limit"])

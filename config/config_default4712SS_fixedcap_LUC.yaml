@@ -1,0 +1,69 @@
+# Fixed-capacity hourly dispatch ("operations") run on the solved default4712SS
+# network, DE copperplate, WITH linearized unit commitment (LUC) on the pure-
+# power dispatchable links. Single pass (perfect foresight).
+#
+# Purpose: test whether unit commitment (minimum load, start-up costs, up/down
+# times) adds intra-day structure to the German price series compared to the
+# plain fixed-capacity run (default4712SS_fixedcap).
+#
+# CHP is deliberately EXCLUDED from unit commitment: its dispatch is heat-driven
+# (fixed heat:power ratio, runs only in the heating season, ~0 in summer), so
+# electrical commitment constraints do not represent it. Only CCGT/OCGT/H2 CCGT.
+#
+# Run (2025 / 2035 / 2045):
+#   snakemake --profile slurm --rerun-triggers mtime --keep-going \
+#     results/default4712SS_fixedcap_LUC/KN2045_Mix/networks/base_s_27__none_2025_op.nc \
+#     results/default4712SS_fixedcap_LUC/KN2045_Mix/networks/base_s_27__none_2035_op.nc \
+#     results/default4712SS_fixedcap_LUC/KN2045_Mix/networks/base_s_27__none_2045_op.nc \
+#     --configfile config/config_default4712SS_fixedcap_LUC.yaml
+
+run:
+  prefix: default4712SS_fixedcap_LUC
+
+# Kept identical to the source run (default4712SS) so the donor's data
+# preparation is consistent with how the source networks were built.
+scenario:
+  planning_horizons:
+  - 2025
+  - 2030
+  - 2035
+  - 2040
+  - 2045
+
+atlite:
+  nprocesses: 4
+
+clustering:
+  temporal:
+    resolution_sector: false   # native hourly resolution for the dispatch network
+
+solve_operations:
+  source_network: "results/default4712SS/KN2045_Mix/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
+  copperplate_zones:
+  - ["DE"]                     # one German bidding zone
+  unfix_free_stores: true
+  co2_atmosphere_constraint: true   # single pass: keep the annual CO2 budget
+  unit_commitment:
+    enable: true
+    source: data/unit_commitment.csv
+    # network link carrier -> parameter column in the CSV. CHP omitted (heat-driven).
+    carriers:
+      CCGT: CCGT
+      OCGT: OCGT
+      H2 CCGT: CCGT      # H2-fired CCGT: reuse CCGT commitment parameters
+
+solving:
+  mem_mb: 160000
+  runtime: 24h
+  options:
+    # Linearized: binary on/off relaxed to a continuous fraction online, so the
+    # 8760 h problem stays an LP. Interprets the per-node fleet aggregate as a
+    # share committed rather than a single unit switching on/off.
+    linearized_unit_commitment: true
+    # Fixed capacities against block-averaged profiles can leave single hours
+    # short; load shedding/sinks turn those into scarcity prices, not infeasibilities.
+    load_shedding:
+      enable: true
+    load_sinks:
+      enable: true
+      all_carriers: true
