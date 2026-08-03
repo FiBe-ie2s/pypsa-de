@@ -22,6 +22,10 @@ class _UnitCommitmentConfig(ConfigModel):
         default_factory=dict,
         description="Mapping of a network link carrier to the parameter column of `source` to use for it, e.g. {'CCGT': 'CCGT', 'H2 CCGT': 'CCGT'}. Heat-driven CHP carriers should be omitted, as their commitment is set by heat demand, not the electricity market.",
     )
+    countries: list[str] = Field(
+        default_factory=list,
+        description="Restrict unit commitment to links whose output bus is in these countries, e.g. ['DE']. Bounds problem size, since each committable unit adds status variables and up/down-time constraints over all snapshots. Empty applies it everywhere.",
+    )
 
 
 class SolveOperationsConfig(ConfigModel):

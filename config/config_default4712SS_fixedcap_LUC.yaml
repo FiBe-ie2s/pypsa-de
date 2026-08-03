@@ -46,6 +46,7 @@ solve_operations:
   unit_commitment:
     enable: true
     source: data/unit_commitment.csv
+    countries: ["DE"]    # commitment only for German plants (bounds problem size)
     # network link carrier -> parameter column in the CSV. CHP omitted (heat-driven).
     carriers:
       CCGT: CCGT
@@ -53,7 +54,7 @@ solve_operations:
       H2 CCGT: CCGT      # H2-fired CCGT: reuse CCGT commitment parameters
 
 solving:
-  mem_mb: 160000
+  mem_mb: 200000
   runtime: 24h
   options:
     # Linearized: binary on/off relaxed to a continuous fraction online, so the

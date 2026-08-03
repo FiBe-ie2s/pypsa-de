@@ -507,7 +507,10 @@ UC_PER_MW_ATTRS = {"start_up_cost", "shut_down_cost", "stand_by_cost"}
 
 
 def apply_unit_commitment(
-    n: pypsa.Network, carriers: dict[str, str], source: str
+    n: pypsa.Network,
+    carriers: dict[str, str],
+    source: str,
+    countries: list[str] | None = None,
 ) -> list[tuple[str, str, int]]:
     """
     Make selected dispatchable links committable for linearized unit commitment.
@@ -518,6 +521,11 @@ def apply_unit_commitment(
     ``p_min_pu``, ramp limits and snapshot-counted up/down times; per-MW-electric
     start-up costs are scaled by each link's electric capacity.
 
+    ``countries`` restricts commitment to links whose output bus (``bus1``) sits
+    in one of the given countries (e.g. ``["DE"]``); this keeps the problem size
+    bounded, as each committable unit adds status variables and up/down-time
+    constraints over all snapshots. Empty or None applies it everywhere.
+
     The binary status is relaxed to a continuous fraction online through
     ``solving.options.linearized_unit_commitment``, keeping the problem an LP.
 
@@ -527,6 +535,7 @@ def apply_unit_commitment(
         ``(carrier, column, n_links)`` for each applied carrier.
     """
     uc = pd.read_csv(source, index_col=0)
+    bus1_country = n.links.bus1.map(n.buses.country) if countries else None
     applied = []
 
     for carrier, column in carriers.items():
@@ -535,7 +544,10 @@ def apply_unit_commitment(
                 f"Unit-commitment column '{column}' not in {source}; "
                 f"available: {list(uc.columns)}."
             )
-        idx = n.links.index[(n.links.carrier == carrier) & (n.links.p_nom > 0)]
+        match = (n.links.carrier == carrier) & (n.links.p_nom > 0)
+        if countries:
+            match &= bus1_country.isin(countries)
+        idx = n.links.index[match]
         if idx.empty:
             logger.info(f"No links with carrier '{carrier}' and p_nom > 0; skipping.")
             continue
@@ -693,12 +705,18 @@ if __name__ == "__main__":
     if options.get("unfix_free_stores", True):
         unfix_free_stores(n)
 
-    apply_copperplate(n, options.get("copperplate_zones", []))
-
     uc = options.get("unit_commitment", {})
     if uc.get("enable", False):
-        # after fix_all_capacities so start-up costs scale with the fixed p_nom
-        apply_unit_commitment(n, uc.get("carriers", {}), uc.get("source"))
+        # after fix_all_capacities (start-up costs scale with the fixed p_nom),
+        # before copperplating (bus1 countries still distinct)
+        apply_unit_commitment(
+            n,
+            uc.get("carriers", {}),
+            uc.get("source"),
+            uc.get("countries", []),
+        )
+
+    apply_copperplate(n, options.get("copperplate_zones", []))
 
     # prepare_network re-adds this constraint from config
     readd = n.global_constraints.index.intersection(["co2_sequestration_limit"])

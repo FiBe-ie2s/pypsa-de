@@ -520,14 +520,25 @@ def make_uc_network():
     n.set_snapshots(DENSE)
     n.add(
         "Bus",
-        ["DE gas", "DE0", "DE0 heat"],
-        carrier=["gas", "AC", "urban central heat"],
+        ["DE gas", "DE0", "DE0 heat", "FR0"],
+        carrier=["gas", "AC", "urban central heat", "AC"],
+        country=["DE", "DE", "DE", "FR"],
     )
     n.add(
         "Link",
         "DE0 CCGT",
         bus0="DE gas",
         bus1="DE0",
+        carrier="CCGT",
+        p_nom=500.0,
+        efficiency=0.58,
+    )
+    # foreign CCGT: excluded when commitment is restricted to DE
+    n.add(
+        "Link",
+        "FR0 CCGT",
+        bus0="DE gas",
+        bus1="FR0",
         carrier="CCGT",
         p_nom=500.0,
         efficiency=0.58,
@@ -577,10 +588,20 @@ class TestApplyUnitCommitment:
         apply_unit_commitment(n, {"CCGT": "CCGT", "OCGT": "OCGT"}, uc_source)
 
         committable = set(n.links.index[n.links.committable])
-        assert committable == {"DE0 CCGT", "DE0 OCGT"}
+        # without a country filter, foreign CCGT is included too
+        assert committable == {"DE0 CCGT", "DE0 OCGT", "FR0 CCGT"}
         # zero-capacity vintage and CHP stay non-committable
         assert not n.links.at["DE0 CCGT old", "committable"]
         assert not n.links.at["DE0 CHP", "committable"]
+
+    def test_countries_restricts_to_domestic_links(self, uc_source):
+        n = make_uc_network()
+        apply_unit_commitment(
+            n, {"CCGT": "CCGT", "OCGT": "OCGT"}, uc_source, countries=["DE"]
+        )
+        committable = set(n.links.index[n.links.committable])
+        assert committable == {"DE0 CCGT", "DE0 OCGT"}
+        assert not n.links.at["FR0 CCGT", "committable"]
 
     def test_copies_per_unit_params_directly(self, uc_source):
         n = make_uc_network()
