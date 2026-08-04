@@ -596,6 +596,30 @@ def apply_co2_price(n: pypsa.Network, co2_price: float) -> None:
     )
 
 
+def resolve_co2_price(co2_price, planning_horizons: str | None) -> float | None:
+    """
+    Resolve a scalar or per-year-mapping ``co2_price`` to a single value.
+
+    ``co2_price`` is either a number (same price every year) or a mapping of
+    planning horizon to price (e.g. ``{2025: 0, 2035: 123.6}``), since the
+    single-pass CO2 shadow price differs by year. Returns None when unset.
+    """
+    if co2_price is None or not isinstance(co2_price, dict):
+        return co2_price
+    if planning_horizons is None:
+        raise ValueError(
+            "co2_price is a per-year mapping but no planning_horizons wildcard "
+            "is set to look it up."
+        )
+    for key in (int(planning_horizons), str(planning_horizons)):
+        if key in co2_price:
+            return co2_price[key]
+    raise ValueError(
+        f"No co2_price entry for planning horizon {planning_horizons}; "
+        f"available: {sorted(co2_price)}."
+    )
+
+
 class _FailedWindowWatcher(logging.Handler):
     """
     Collect PyPSA's per-window "Optimization failed" warnings.
@@ -740,12 +764,14 @@ if __name__ == "__main__":
         seed_initial_state_of_charge(n, source_storage_levels)
 
         # A per-window annual CO2 budget is meaningless under rolling horizon;
-        # price emissions at a fixed rate (from the single-pass shadow price).
-        co2_price = options.get("co2_price")
+        # price emissions at a fixed rate (from the single-pass shadow price of
+        # this planning horizon).
+        co2_price = resolve_co2_price(options.get("co2_price"), planning_horizons)
         if co2_price is None:
             raise ValueError(
                 "solve_operations.co2_price (EUR/t) is required for rolling-horizon "
-                "runs. Use the CO2 shadow price of the single-pass run."
+                "runs. Use the CO2 shadow price of the single-pass run (scalar, or "
+                "a per-year mapping)."
             )
         apply_co2_price(n, co2_price)
 

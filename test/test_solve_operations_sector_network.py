@@ -24,6 +24,7 @@ from scripts.solve_operations_sector_network import (
     map_target_to_donor,
     overwrite_dynamic_from_donor,
     prorate_operational_limits,
+    resolve_co2_price,
     seed_initial_state_of_charge,
     unfix_free_stores,
     upsample_to_dense,
@@ -502,6 +503,32 @@ class TestApplyCo2Price:
         n.add("Bus", "DE0", carrier="AC")
         with pytest.raises(ValueError, match="atmospheric CO2 store"):
             apply_co2_price(n, 123.6)
+
+
+class TestResolveCo2Price:
+    def test_scalar_is_returned_unchanged(self):
+        assert resolve_co2_price(123.6, "2035") == 123.6
+        assert resolve_co2_price(0, "2025") == 0
+
+    def test_none_is_returned(self):
+        assert resolve_co2_price(None, "2035") is None
+
+    def test_mapping_is_looked_up_by_year(self):
+        mapping = {2025: 0, 2035: 123.6, 2045: 133.9}
+        assert resolve_co2_price(mapping, "2025") == 0
+        assert resolve_co2_price(mapping, "2035") == 123.6
+        assert resolve_co2_price(mapping, "2045") == 133.9
+
+    def test_mapping_accepts_string_keys(self):
+        assert resolve_co2_price({"2035": 123.6}, "2035") == 123.6
+
+    def test_missing_year_raises(self):
+        with pytest.raises(ValueError, match="No co2_price entry"):
+            resolve_co2_price({2035: 123.6}, "2025")
+
+    def test_mapping_without_horizon_raises(self):
+        with pytest.raises(ValueError, match="no planning_horizons"):
+            resolve_co2_price({2035: 123.6}, None)
 
 
 UC_CSV = (

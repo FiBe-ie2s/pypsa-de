@@ -47,9 +47,9 @@ class SolveOperationsConfig(ConfigModel):
         True,
         description="Single-pass runs only: re-apply GlobalConstraints of type 'co2_atmosphere' (EU CO2 limit and national CO2 budgets) via add_co2_atmosphere_constraint. GlobalConstraints of type 'operational_limit' are always re-applied natively by PyPSA. Rolling-horizon runs ignore this and use co2_price instead.",
     )
-    co2_price: float | None = Field(
+    co2_price: float | dict[int, float] | None = Field(
         None,
-        description="CO2 price in EUR/tonne applied as a fixed emission cost in rolling-horizon dispatch runs (required there), where the annual co2_atmosphere budget cannot be imposed per window. Take it from the constant CO2 shadow price of the single-pass run of the same fixed-capacity setup.",
+        description="CO2 price in EUR/tonne applied as a fixed emission cost in rolling-horizon dispatch runs (required there), where the annual co2_atmosphere budget cannot be imposed per window. Either a single value for every year, or a mapping of planning horizon to value (e.g. {2025: 0, 2035: 123.6, 2045: 133.9}). Take each from the constant CO2 shadow price of the single-pass run of that year.",
     )
     unit_commitment: _UnitCommitmentConfig = Field(
         default_factory=_UnitCommitmentConfig,

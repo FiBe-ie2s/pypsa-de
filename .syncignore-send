@@ -12,6 +12,8 @@ resources
 results
 benchmarks
 logs
+thesis
+
 # git
 .git
 

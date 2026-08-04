@@ -42,8 +42,11 @@ solve_operations:
   - ["DE"]                     # one German bidding zone
   unfix_free_stores: true
   # Fixed CO2 price (EUR/t) applied to emissions instead of an annual budget.
-  # Value = constant CO2 shadow price of the single-pass run (default4712SS_fixedcap).
-  co2_price: 123.6
+  # Per year = constant CO2 shadow price of the single-pass run (default4712SS_fixedcap);
+  # 2025 is 0 because the CO2 budget does not bind that year.
+  co2_price:
+    2025: 0
+    2035: 123.6
 
 solving:
   # Rolling horizon peak memory is far below the single-pass run (each window is
